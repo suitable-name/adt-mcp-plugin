@@ -1,15 +1,19 @@
 package com.sap.adt.mcp.ui;
 
-import java.net.URI;
+import java.lang.reflect.InvocationTargetException;
 import java.util.List;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
+import org.eclipse.core.resources.IProject;
+import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.core.runtime.IStatus;
 import org.eclipse.jface.dialogs.Dialog;
-import org.eclipse.jface.dialogs.IDialogConstants;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.dialogs.InputDialog;
+import org.eclipse.jface.dialogs.ProgressMonitorDialog;
+import org.eclipse.jface.viewers.LabelProvider;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.SWTException;
 import org.eclipse.swt.custom.StyledText;
@@ -18,26 +22,32 @@ import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.layout.RowLayout;
 import org.eclipse.swt.widgets.Button;
 import org.eclipse.swt.widgets.Composite;
-import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Label;
-import org.eclipse.swt.widgets.Shell;
-import org.eclipse.swt.widgets.Text;
+import org.eclipse.ui.PlatformUI;
+import org.eclipse.ui.dialogs.ElementListSelectionDialog;
 import org.eclipse.ui.part.ViewPart;
 
-import com.sap.adt.mcp.sap.AdtRestClient;
+import com.sap.adt.destinations.ui.logon.AdtLogonServiceUIFactory;
+import com.sap.adt.mcp.Activator;
+import com.sap.adt.mcp.preferences.PreferenceInitializer;
+import com.sap.adt.mcp.sap.AdtProjectClient;
 import com.sap.adt.mcp.server.RelayBridge;
 import com.sap.adt.mcp.server.RelayEnrollment;
 import com.sap.adt.mcp.server.RelayIdentity;
 import com.sap.adt.mcp.server.RelayProfileStore;
 import com.sap.adt.mcp.tools.*;
+import com.sap.adt.tools.core.project.AdtProjectServiceFactory;
+import com.sap.adt.tools.core.project.IAbapProject;
 
 /** Manages workspace enrollment and the outbound relay connection. */
 public class McpServerView extends ViewPart {
     public static final String ID = "com.sap.adt.mcp.server.view";
 
     private final RelayProfileStore profiles = new RelayProfileStore();
-    private AdtRestClient adtClient;
+    private AdtProjectClient adtClient;
+    private IProject selectedProject;
+    private boolean selectingProject;
     private RelayBridge bridge;
     private Thread enrollmentWorker;
     private boolean connected;
@@ -47,11 +57,6 @@ public class McpServerView extends ViewPart {
     private Button sapButton;
     private Button bridgeButton;
     private StyledText outputText;
-    private String sapUrl;
-    private String sapUser;
-    private String sapPassword;
-    private String sapClient;
-    private String sapLanguage = "EN";
 
     @Override
     public void createPartControl(Composite parent) {
@@ -62,14 +67,16 @@ public class McpServerView extends ViewPart {
         actions.setLayout(new RowLayout(SWT.HORIZONTAL));
         actions.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
         registerButton = button(actions, "Register Eclipse", this::register);
-        sapButton = button(actions, "Connect SAP", this::showConnectionDialog);
+        sapButton = button(actions, "Select ABAP Project", this::selectProject);
         bridgeButton = button(actions, "Connect Relay", this::toggleRelay);
 
         outputText = new StyledText(parent, SWT.BORDER | SWT.MULTI | SWT.V_SCROLL | SWT.H_SCROLL);
         outputText.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, true));
         outputText.setEditable(false);
         button(actions, "Clear", () -> outputText.setText(""));
+        restoreSelectedProject();
         updateControls();
+        parent.getDisplay().timerExec(1000, this::checkProjectConnection);
     }
 
     private static Button button(Composite parent, String text, Runnable action) {
@@ -82,15 +89,18 @@ public class McpServerView extends ViewPart {
     private void updateControls() {
         boolean registering = enrollmentWorker != null;
         boolean enrolled = profiles.exists();
-        boolean loggedIn = adtClient != null;
+        boolean hasProject = selectedProject != null && selectedProject.isAccessible();
         registerButton.setText(registering ? "Cancel Registration" : enrolled ? "Register Again" : "Register Eclipse");
-        registerButton.setEnabled(bridge == null);
-        sapButton.setEnabled(bridge == null && !registering);
+        registerButton.setEnabled(bridge == null && !selectingProject);
+        sapButton.setEnabled(bridge == null && !registering && !selectingProject);
         bridgeButton.setText(bridge == null ? "Connect Relay" : connected ? "Disconnect Relay" : "Cancel Connection");
-        bridgeButton.setEnabled(bridge != null || loggedIn && enrolled && !registering);
+        bridgeButton.setEnabled(!selectingProject && (bridge != null || hasProject && enrolled && !registering));
         String relayStatus = registering ? "Waiting for registration" : !enrolled ? "Registration required"
                 : connected ? "Relay connected" : bridge != null ? "Relay connecting" : "Relay disconnected";
-        status.setText((loggedIn ? "SAP connected" : "SAP disconnected") + " | " + relayStatus);
+        String projectStatus = selectingProject ? "Opening ADT project" : !hasProject ? "Select an ABAP project"
+                : "ABAP project " + selectedProject.getName();
+        if (!selectingProject && adtClient != null) projectStatus += " · " + adtClient.getUsername();
+        status.setText(projectStatus + " | " + relayStatus);
         status.getParent().layout(true, true);
     }
 
@@ -166,79 +176,121 @@ public class McpServerView extends ViewPart {
         }
     }
 
-    private void showConnectionDialog() {
-        ConnectionDialog dialog = new ConnectionDialog(getSite().getShell());
-        if (dialog.open() == Dialog.OK) {
-            sapUrl = dialog.getUrl();
-            sapUser = dialog.getUser();
-            sapPassword = dialog.getPassword();
-            sapClient = dialog.getSapClient();
-            sapLanguage = dialog.getLanguage();
-
-            // Save connection details (never password) for next time
-            saveConnectionHistory();
-
-            connectToSap();
-        }
-    }
-
-    private void saveConnectionHistory() {
-        try {
-            org.eclipse.jface.preference.IPreferenceStore store =
-                    com.sap.adt.mcp.Activator.getDefault().getPreferenceStore();
-
-            store.setValue(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_LAST_URL, sapUrl);
-            store.setValue(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_LAST_USER, sapUser);
-            store.setValue(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_LAST_CLIENT, sapClient);
-            store.setValue(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_LAST_LANGUAGE, sapLanguage);
-
-            // Add URL to history (keep last 10, semicolon-separated)
-            String history = store.getString(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_URL_HISTORY);
-            java.util.LinkedHashSet<String> urls = new java.util.LinkedHashSet<>();
-            urls.add(sapUrl); // most recent first
-            if (history != null && !history.isEmpty()) {
-                for (String u : history.split(";")) {
-                    if (!u.trim().isEmpty()) urls.add(u.trim());
-                }
+    private void restoreSelectedProject() {
+        String name = Activator.getDefault().getPreferenceStore().getString(PreferenceInitializer.PREF_LAST_PROJECT);
+        if (name.isEmpty()) return;
+        for (IProject project : ResourcesPlugin.getWorkspace().getRoot().getProjects()) {
+            if (project.getName().equals(name) && project.isAccessible()
+                    && project.getAdapter(IAbapProject.class) != null) {
+                selectedProject = project;
+                return;
             }
-            // Keep max 10
-            StringBuilder sb = new StringBuilder();
-            int count = 0;
-            for (String u : urls) {
-                if (count++ >= 10) break;
-                if (sb.length() > 0) sb.append(";");
-                sb.append(u);
+        }
+    }
+
+    private void selectProject() {
+        if (bridge != null || selectingProject) return;
+        ElementListSelectionDialog dialog = new ElementListSelectionDialog(getSite().getShell(), new LabelProvider() {
+            @Override
+            public String getText(Object element) {
+                return ((IProject) element).getName();
             }
-            store.setValue(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_URL_HISTORY, sb.toString());
-        } catch (Exception e) {
-            // Preference store not available, ignore
+        });
+        dialog.setTitle("Select ABAP Project");
+        dialog.setMessage("Select an existing ABAP project. ADT will open its standard logon dialog if needed.");
+        dialog.setEmptyListMessage("No ABAP projects are available. Open an ABAP project in Project Explorer first.");
+        dialog.setMultipleSelection(false);
+        dialog.setElements(AdtProjectServiceFactory.createProjectService().getAvailableAbapProjects());
+        if (selectedProject != null) dialog.setInitialSelections(new Object[] { selectedProject });
+        if (dialog.open() == Dialog.OK && !status.isDisposed()) {
+            prepareProject((IProject) dialog.getFirstResult());
         }
     }
 
-    private void connectToSap() {
-        if (adtClient != null) adtClient.logout();
-        adtClient = null;
-        try {
-            AdtRestClient candidate = new AdtRestClient(sapUrl, sapUser, sapPassword, sapClient, sapLanguage);
-            candidate.login();
-            adtClient = candidate;
-            appendOutput("Connected to SAP.\n");
-        } catch (Exception e) {
-            appendOutput("Could not connect to SAP. Check the HTTPS URL, certificate, and login details.\n");
-        } finally {
-            sapPassword = null;
-            updateControls();
-        }
-    }
-
-    private static boolean isHttpsSapUrl(String value) {
-        try {
-            URI uri = URI.create(value);
-            return "https".equalsIgnoreCase(uri.getScheme()) && uri.getHost() != null
-                    && uri.getUserInfo() == null && uri.getQuery() == null && uri.getFragment() == null;
-        } catch (IllegalArgumentException e) {
+    private boolean prepareProject(IProject project) {
+        if (status.isDisposed()) return false;
+        if (project == null || !project.isAccessible()) {
+            appendOutput("Select an open ABAP project from this Eclipse workspace.\n");
             return false;
         }
+        if (project.equals(selectedProject) && adtClient != null && adtClient.isLoggedIn()) return true;
+        IAbapProject abapProject = project.getAdapter(IAbapProject.class);
+        if (abapProject == null) {
+            appendOutput("The selected project is not an ABAP project.\n");
+            return false;
+        }
+        long attempt = ++generation;
+        selectingProject = true;
+        updateControls();
+        try {
+            IStatus logon = AdtLogonServiceUIFactory.createLogonServiceUI().ensureLoggedOn(
+                    abapProject.getDestinationData(), PlatformUI.getWorkbench().getProgressService());
+            if (!logon.isOK()) {
+                appendOutput(logon.matches(IStatus.CANCEL) ? "ADT logon canceled.\n"
+                        : "ADT could not authenticate the selected project. Check its connection in Project Explorer.\n");
+                return false;
+            }
+            if (status.isDisposed() || generation != attempt) return false;
+            AdtProjectClient candidate = new AdtProjectClient(project);
+            boolean installed = false;
+            try {
+                new ProgressMonitorDialog(getSite().getShell()).run(true, true, monitor -> {
+                    monitor.beginTask("Opening the selected ADT project", 1);
+                    try {
+                        if (monitor.isCanceled()) throw new InterruptedException();
+                        candidate.login(monitor);
+                        if (monitor.isCanceled()) throw new InterruptedException();
+                    } catch (InterruptedException e) {
+                        throw e;
+                    } catch (Exception e) {
+                        throw new InvocationTargetException(e);
+                    } finally {
+                        monitor.done();
+                    }
+                });
+                if (status.isDisposed() || generation != attempt) return false;
+                retireClient();
+                adtClient = candidate;
+                selectedProject = project;
+                installed = true;
+                Activator.getDefault().getPreferenceStore().setValue(PreferenceInitializer.PREF_LAST_PROJECT, project.getName());
+                appendOutput("Selected ABAP project " + project.getName() + " for user " + candidate.getUsername() + ".\n");
+                return true;
+            } finally {
+                if (!installed) candidate.logout();
+            }
+        } catch (InterruptedException e) {
+            appendOutput("Opening the ADT project was canceled.\n");
+            return false;
+        } catch (Exception e) {
+            appendOutput("Could not open the selected ADT project. Check its connection and login in Project Explorer.\n");
+            return false;
+        } finally {
+            selectingProject = false;
+            if (!status.isDisposed()) updateControls();
+        }
+    }
+
+    private void retireClient() {
+        if (adtClient != null) {
+            adtClient.logout();
+            adtClient = null;
+        }
+    }
+
+    private void checkProjectConnection() {
+        if (status.isDisposed()) return;
+        if (!selectingProject && projectConnectionChanged()) {
+            disconnectRelay();
+            appendOutput("The selected ADT project was closed or its login changed. Select the ABAP project again.\n");
+            updateControls();
+        }
+        status.getDisplay().timerExec(1000, this::checkProjectConnection);
+    }
+
+    private boolean projectConnectionChanged() {
+        return selectedProject != null && !selectedProject.isAccessible()
+                || adtClient != null && !adtClient.isLoggedIn();
     }
 
     private List<McpTool> sapTools() {
@@ -255,6 +307,7 @@ public class McpServerView extends ViewPart {
             updateControls();
             return;
         }
+        if (!prepareProject(selectedProject)) return;
         RelayIdentity identity;
         try {
             identity = profiles.load();
@@ -306,11 +359,17 @@ public class McpServerView extends ViewPart {
     }
 
     private void disconnectRelay() {
-        ++generation;
         connected = false;
+        boolean projectChanged = projectConnectionChanged();
         if (bridge != null) {
+            ++generation;
             bridge.close();
             bridge = null;
+        }
+        retireClient();
+        if (projectChanged) {
+            selectedProject = null;
+            Activator.getDefault().getPreferenceStore().setToDefault(PreferenceInitializer.PREF_LAST_PROJECT);
         }
     }
 
@@ -332,132 +391,7 @@ public class McpServerView extends ViewPart {
     public void dispose() {
         cancelRegistration();
         disconnectRelay();
-        if (adtClient != null) adtClient.logout();
         super.dispose();
     }
 
-    /**
-     * Connection dialog for SAP system details.
-     * Loads previous connection details from preferences (except password).
-     */
-    private class ConnectionDialog extends Dialog {
-        private org.eclipse.swt.widgets.Combo urlCombo;
-        private Text userText;
-        private Text passwordText;
-        private Text clientText;
-        private Text languageText;
-
-        private String url;
-        private String user;
-        private String password;
-        private String client;
-        private String language;
-
-        protected ConnectionDialog(Shell parentShell) {
-            super(parentShell);
-        }
-
-        @Override
-        protected void configureShell(Shell shell) {
-            super.configureShell(shell);
-            shell.setText("Connect to SAP System");
-        }
-
-        @Override
-        protected Control createDialogArea(Composite parent) {
-            Composite container = (Composite) super.createDialogArea(parent);
-            container.setLayout(new GridLayout(2, false));
-
-            // Load saved values from preferences
-            String savedUrl = "";
-            String savedUser = "";
-            String savedClient = "100";
-            String savedLanguage = "EN";
-            String[] urlHistory = new String[0];
-
-            try {
-                org.eclipse.jface.preference.IPreferenceStore store =
-                        com.sap.adt.mcp.Activator.getDefault().getPreferenceStore();
-                savedUrl = store.getString(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_LAST_URL);
-                savedUser = store.getString(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_LAST_USER);
-                savedClient = store.getString(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_LAST_CLIENT);
-                savedLanguage = store.getString(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_LAST_LANGUAGE);
-                String history = store.getString(com.sap.adt.mcp.preferences.PreferenceInitializer.PREF_URL_HISTORY);
-                if (history != null && !history.isEmpty()) {
-                    urlHistory = history.split(";");
-                }
-            } catch (Exception e) {
-                // Preferences not available
-            }
-
-            // Use saved values, fall back to current session values, then defaults
-            String defaultUrl = !savedUrl.isEmpty() ? savedUrl : (sapUrl != null ? sapUrl : "");
-            String defaultUser = !savedUser.isEmpty() ? savedUser : (sapUser != null ? sapUser : "");
-            String defaultClient = !savedClient.isEmpty() ? savedClient : (sapClient != null ? sapClient : "100");
-            String defaultLanguage = !savedLanguage.isEmpty() ? savedLanguage : (sapLanguage != null ? sapLanguage : "EN");
-
-            new Label(container, SWT.NONE).setText("SAP URL:");
-            urlCombo = new org.eclipse.swt.widgets.Combo(container, SWT.BORDER);
-            urlCombo.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
-            // Populate URL dropdown with history
-            for (String histUrl : urlHistory) {
-                if (!histUrl.trim().isEmpty()) {
-                    urlCombo.add(histUrl.trim());
-                }
-            }
-            urlCombo.setText(defaultUrl);
-
-            new Label(container, SWT.NONE).setText("User:");
-            userText = new Text(container, SWT.BORDER);
-            userText.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
-            userText.setText(defaultUser);
-
-            new Label(container, SWT.NONE).setText("Password:");
-            passwordText = new Text(container, SWT.BORDER | SWT.PASSWORD);
-            passwordText.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
-
-            new Label(container, SWT.NONE).setText("Client:");
-            clientText = new Text(container, SWT.BORDER);
-            clientText.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
-            clientText.setText(defaultClient);
-
-            new Label(container, SWT.NONE).setText("Language:");
-            languageText = new Text(container, SWT.BORDER);
-            languageText.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
-            languageText.setText(defaultLanguage);
-
-            // Focus password field since other fields are pre-filled
-            container.getDisplay().asyncExec(() -> passwordText.setFocus());
-
-            return container;
-        }
-
-        @Override
-        protected void createButtonsForButtonBar(Composite parent) {
-            createButton(parent, IDialogConstants.OK_ID, "Connect", true);
-            createButton(parent, IDialogConstants.CANCEL_ID, IDialogConstants.CANCEL_LABEL, false);
-        }
-
-        @Override
-        protected void okPressed() {
-            url = urlCombo.getText().trim();
-            if (!isHttpsSapUrl(url)) {
-                org.eclipse.jface.dialogs.MessageDialog.openError(getShell(), "SAP Connection",
-                        "Enter an HTTPS base URL for the SAP system to use the company relay.");
-                urlCombo.setFocus();
-                return;
-            }
-            user = userText.getText().trim();
-            password = passwordText.getText();
-            client = clientText.getText().trim();
-            language = languageText.getText().trim();
-            super.okPressed();
-        }
-
-        public String getUrl() { return url; }
-        public String getUser() { return user; }
-        public String getPassword() { return password; }
-        public String getSapClient() { return client; }
-        public String getLanguage() { return language; }
-    }
 }

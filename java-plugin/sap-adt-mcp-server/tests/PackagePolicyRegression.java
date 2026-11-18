@@ -77,6 +77,19 @@ public final class PackagePolicyRegression {
         check(sap.paths.isEmpty());
         check(resultText(call(relay, "sap_create_object", create, SCOPE)).contains("created"));
         check(sap.posted.contains("<adtcore:packageRef adtcore:name=\"/NS/ZAPP\""));
+        checkLockOwnership();
+    }
+
+    private static void checkLockOwnership() {
+        FakeSap first = new FakeSap();
+        FakeSap second = new FakeSap();
+        first.rememberLock("shared-handle", URI);
+        check(first.ownsLock("shared-handle", URI));
+        check(!second.ownsLock("shared-handle", URI));
+        first.forgetLock("shared-handle", URI + "/other");
+        check(first.ownsLock("shared-handle", URI));
+        first.logout();
+        check(!first.ownsLock("shared-handle", URI));
     }
 
     private static JsonObject call(RelayRequests relay, String tool, String args, String layers) {
@@ -113,7 +126,19 @@ public final class PackagePolicyRegression {
         String afterSource;
         String posted;
 
-        FakeSap() { super("https://unused.invalid", "", "", "100", "EN"); }
+        @Override
+        public void login() { }
+
+        @Override
+        public boolean isLoggedIn() { return true; }
+
+        @Override
+        public String getUsername() { return "TEST"; }
+
+        @Override
+        public HttpResponse<String> delete(String path) {
+            throw new AssertionError("Unexpected delete in package policy regression.");
+        }
 
         @Override
         public HttpResponse<String> get(String path, String accept) {

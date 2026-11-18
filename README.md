@@ -1,6 +1,6 @@
 # SAP ADT MCP Relay
 
-A desktop MCP host launches `sap-adt-mcp-client` over stdio. The client connects to the Rust relay using its enrolled certificate. Eclipse opens an outbound WebSocket to the same relay using a separately enrolled Eclipse certificate. SAP credentials stay in the Eclipse workspace. The relay sees the tool arguments and results.
+A desktop MCP host launches `sap-adt-mcp-client` over stdio. The client connects to the Rust relay using its enrolled certificate. Eclipse opens an outbound WebSocket to the same relay using a separately enrolled Eclipse certificate. SAP access uses the selected Eclipse ADT project's connection and authentication. The relay sees the tool arguments and results.
 
 One relay can serve multiple Eclipse workspaces. Each user enrolls a desktop profile, and the operator assigns that profile the Eclipse endpoints it may use. New desktops have no endpoint grants and default to read-only tool access. Each call runs under the SAP account connected in the selected workspace, subject to the relay's action and package rules.
 
@@ -29,7 +29,7 @@ cargo +1.95.0 build --locked --workspace --bins
 
 The Rust executables are in `target/debug`. Build for each intended platform.
 
-Build the Eclipse update site with Maven 3.10.0 and JDK 21. Tycho 5.0.4 compiles the plugin for Java 17. Install locally from the generated ZIP or repository directory. [Local build and harness instructions](docs/verification.md#eclipse-plugin-build)
+Build the Eclipse update site with Maven 3.10.0 and JDK 21. Tycho 5.0.4 compiles the plugin for Java 17 and resolves SAP ADT dependencies from SAP's public 2024-03 p2 repository. Install locally from the generated ZIP or repository directory into Eclipse with SAP ADT installed. [Local build and harness instructions](docs/verification.md#eclipse-plugin-build)
 
 To publish the plugin on GitHub Pages, enable Pages with **GitHub Actions** as the source and trigger the Eclipse update site workflow from the **Actions** tab. It builds the plugin and runs the Java package-policy harness before deployment. [Publishing and installation instructions](docs/eclipse-update-site.md#publish-with-the-manual-workflow)
 
@@ -77,7 +77,9 @@ The token follows the `diagram_loader` GW1 format, which combines a random 256-b
 
 ### Eclipse
 
-Open **Window → Show View → Other → SAP ADT MCP → SAP ADT Relay**. Register the workspace using `https://adt-relay.company.example:8788` for enrollment and `wss://adt-relay.company.example:8787/bridge` for the bridge. Complete the approval flow above. Connect to the SAP system using its HTTPS base URL, then connect the relay. The JVM trust store must trust your SAP system's certificate. The relay profile supplies trust for the relay connection.
+Open **Window → Show View → Other → SAP ADT MCP → SAP ADT Relay**. Register the workspace using `https://adt-relay.company.example:8788` for enrollment and `wss://adt-relay.company.example:8787/bridge` for the bridge. Complete the approval flow above. Click **Select ABAP Project** and choose the intended existing ADT workspace project in the Eclipse selector. The plugin uses that project's existing connection; ADT opens its normal login dialog if authentication is needed. Click **Connect Relay**. SAP connection settings and authentication are managed by ADT. The relay profile supplies trust for the relay connection.
+
+The bridge stays bound to the explicitly selected project when you switch editor tabs or Project Explorer selections. Disconnect the relay before selecting another project, then reconnect the desktop MCP host. Disconnecting the relay or closing its view releases the plugin's session while preserving the shared ADT login. A normal reconnect uses the selected project. If the project closes, loses authentication, or changes its destination identity, the plugin clears the selection; explicitly select the intended project again and reconnect.
 
 ### Desktop Client
 

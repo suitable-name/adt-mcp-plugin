@@ -8,5 +8,9 @@
             <unit id="org.eclipse.equinox.executable.feature.group" version="0.0.0"/>
             <unit id="org.eclipse.e4.rcp.feature.group" version="0.0.0"/>
         </location>
+        <location includeAllPlatforms="false" includeConfigurePhase="true" includeMode="planner" includeSource="false" type="InstallableUnit">
+            <repository location="https://tools.hana.ondemand.com/2024-03"/>
+            <unit id="com.sap.adt.core.devedition.feature.group" version="3.44.3"/>
+        </location>
     </locations>
 </target>

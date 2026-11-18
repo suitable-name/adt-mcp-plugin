@@ -7,7 +7,14 @@ Bundle-Activator: com.sap.adt.mcp.Activator
 Bundle-Vendor: SAP ADT MCP
 Require-Bundle: org.eclipse.ui,
  org.eclipse.equinox.security,
- org.eclipse.core.runtime
+ org.eclipse.core.runtime,
+ org.eclipse.core.resources
+Import-Package: com.sap.adt.communication.message,
+ com.sap.adt.communication.session,
+ com.sap.adt.destinations.logon,
+ com.sap.adt.destinations.model,
+ com.sap.adt.destinations.ui.logon,
+ com.sap.adt.tools.core.project
 Bundle-RequiredExecutionEnvironment: JavaSE-17
 Automatic-Module-Name: com.sap.adt.mcp.server.plugin
 Bundle-ActivationPolicy: lazy

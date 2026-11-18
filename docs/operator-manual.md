@@ -7,7 +7,7 @@ Use this manual to deploy one relay, connect an Eclipse workspace and MCP host, 
 | Location | Software | Connections |
 | --- | --- | --- |
 | Company server | `sap-adt-mcp-server-relay`, private PKI directory | Accepts TLS connections on the data and enrollment ports |
-| SAP workstation | Eclipse with the rebuilt SAP ADT Relay feature | Opens an outbound WebSocket to the relay and makes HTTPS requests to SAP |
+| SAP workstation | Eclipse with SAP ADT and the rebuilt SAP ADT Relay feature | Opens an outbound WebSocket to the relay and uses the selected ADT project's SAP connection |
 | MCP workstation | Existing MCP host and approved portable `sap-adt-mcp-client` executable | The host launches the executable over stdio. The executable opens outbound HTTPS connections to the relay |
 
 The two workstation roles may share a computer and enroll separately. One relay accepts connections from several Eclipse workspaces. Each workspace has a distinct enrollment certificate. The operator grants individual desktops access to selected workspaces. SAP requests run using the SAP login active in the selected workspace.
@@ -17,7 +17,7 @@ Choose a stable DNS name reachable from both workstations. The server certificat
 ## Install and Initialize
 
 1. Build the two Rust binaries for their destination operating systems and the Eclipse update site with the commands in the [verification checklist](verification.md). Deploy the relay binary on the server and the client binary in a location the desktop host can execute. This procedure requires permission to run the portable helper and install the modified Eclipse feature.
-2. In Eclipse, open **Help → Install New Software → Add**. Enter your team's hosted update site URL, choose **Archive** for the built ZIP, or choose **Local** for the generated `repository` directory. Install the feature from this checkout to get the bridge and package-policy support, then restart Eclipse. [Eclipse update site guide](eclipse-update-site.md)
+2. In an Eclipse installation with SAP ADT, open **Help → Install New Software → Add**. Enter your team's hosted update site URL, choose **Archive** for the built ZIP, or choose **Local** for the generated `repository` directory. Install the feature from this checkout to get the bridge and package-policy support, then restart Eclipse. SAP ADT is required at runtime. [Eclipse update site guide](eclipse-update-site.md)
 3. On the server, create a trusted parent directory under the service account. Choose a new child path for the PKI. Run the commands below from the directory containing the relay executable.
 
 ```powershell
@@ -59,7 +59,11 @@ Enrollment needs the server address and an independent trusted channel between t
 
 Open **Window → Show View → Other → SAP ADT MCP → SAP ADT Relay**. Click **Register Eclipse**. Enter the device label, **Registration URL** such as `https://adt-relay.company.example:8788`, and **Bridge URL** such as `wss://adt-relay.company.example:8787/bridge`. Click **Request Registration** and follow the approval steps.
 
-Click **Connect SAP** and enter the SAP HTTPS base URL, SAP user, password, client, and language. The Eclipse JVM must trust the SAP system's TLS certificate. Click **Connect Relay** and keep the view and workspace open for tool requests. The plugin stores its enrolled identity in the workspace's encrypted `relay-profile.enc` with a wrapping key in Eclipse secure storage. A moved workspace or unavailable secure-storage key may require **Register Again**. Revoke the superseded certificate in **Clients**.
+Click **Select ABAP Project** to open the Eclipse selector listing existing ADT workspace projects. Choose the project for the intended system and account. The plugin uses its existing ADT connection, and ADT opens its normal login dialog if the project needs authentication. Configure SAP connection settings, trust, and login through ADT. Click **Connect Relay** and keep the view and workspace open for tool requests.
+
+The chosen project is fixed for that relay connection. Opening another editor tab or changing the Project Explorer selection does not redirect requests. Disconnect the relay before choosing a different project, reconnect it, and reinitialize the desktop host's MCP connection. Closing the relay view or disconnecting releases the plugin's own session and lock bookkeeping while retaining the ADT project's shared login. A normal **Connect Relay** reconnect uses the selected project. If the project is closed or deleted, its authentication is lost, or its destination identity changes, requests are rejected and the selection is cleared. Restore the intended project, use **Select ABAP Project** again, and reconnect. ADT opens its login dialog if the new selection needs authentication.
+
+The plugin stores its enrolled identity in the workspace's encrypted `relay-profile.enc` with a wrapping key in Eclipse secure storage. A moved workspace or unavailable secure-storage key may require **Register Again**. Revoke the superseded certificate in **Clients**.
 
 ### Desktop MCP Host
 
@@ -139,7 +143,7 @@ The interactive **Logs** tab keeps up to 512 recent entries in memory. Both head
 | Eclipse already connected | A bridge using the same Eclipse certificate is already connected. Enroll each independent workspace separately |
 | Endpoint list empty or selected ID denied | In **Access Rules**, select this desktop fingerprint, press **E**, and check its saved grants. Run the desktop's `endpoints` command again |
 | No endpoint selected | Save an ID from `endpoints` using `--set-endpoint=<id>` with the profile passed by the MCP host, then reconnect |
-| MCP initialization reports Eclipse unavailable | Connect SAP, connect the relay, and wait for the Eclipse bridge-connected log. Use the rebuilt plugin with package-policy support |
+| MCP initialization reports Eclipse unavailable | Use **Select ABAP Project** to choose and authenticate the intended ADT project, connect the relay, and wait for the Eclipse bridge-connected log. Use the rebuilt plugin with package-policy support |
 | Busy relay or expired MCP session | Let the active operation finish. Reconnect the workspace if needed, then reinitialize the host. Sessions expire after eight idle hours or bridge loss |
 | Missing tool or package-denied call | Check both sets of rules, SAP authorization, technical package name, and typed target. Confirm the host has refreshed its catalog |
 | Lost reply during a write or activation | Inspect SAP source, locks, and activation state before retrying. A transport error can follow a completed SAP mutation |

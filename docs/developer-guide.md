@@ -1,6 +1,6 @@
 # Developer Guide
 
-The relay routes each desktop MCP session to its selected, authorized Eclipse workspace. Rust owns transport authentication, endpoint grants, session routing, and desktop policy. The plugin owns tool schemas, SAP credentials, tool execution, and verification of a target object's SAP package.
+The relay routes each desktop MCP session to its selected, authorized Eclipse workspace. Rust owns transport authentication, endpoint grants, session routing, and desktop policy. The plugin owns tool schemas, tool execution, and verification of a target object's SAP package. SAP ADT owns the selected project's connection settings and authentication.
 
 ```mermaid
 sequenceDiagram
@@ -109,6 +109,14 @@ In the plugin, scoped search filters hits by verified ownership. For existing ob
 * The data listener accepts at most 128 concurrent TLS/HTTP connection slots and enrollment uses a separate budget of 32. Both constrain TLS handshake and header read time. The desktop request and Java incoming request limits are 4 MiB. The bridge accepts a response up to 8 MiB. The stdio client bounds concurrency and response size.
 * Logging can include the authorized tool name, desktop fingerprint, and connection or policy events. Exclude request bodies, SAP results, token strings, and private keys. Interactive logs are bounded in memory. Headless logging uses stderr. TUI token copy uses an explicit OSC 52 clipboard request.
 
+## ADT Project Connection
+
+The Eclipse view's **Select ABAP Project** action uses public Eclipse APIs to list existing ADT workspace projects and requests ADT's normal login flow when necessary. ADT's own project-picker implementation is restricted to its declared friend bundles; this plugin uses a standard Eclipse selection dialog. Tool transport is bound to the explicitly chosen project. Selecting another editor tab or Project Explorer item must never alter that binding. A connected relay must be disconnected before the operator can select a different project. A new bridge connection requires fresh MCP initialization.
+
+`AdtRestClient` is the transport-neutral tool boundary. Its ADT implementation uses the selected project's connection and a dedicated ADT session for the relay's stateful operations. The plugin does not collect SAP URL, username, password, client, or language settings. Shared ADT connection management supplies those details and authentication. Calls fail if the selected project becomes unavailable, loses its authenticated state, or changes its destination identity. Invalidation retires the adapter and clears the selected project, requiring explicit selection again. Background tool requests never select another project or open an interactive login dialog.
+
+Retiring the adapter on relay disconnect, view disposal, or replacement clears its explicit lock bookkeeping and releases its dedicated session. It must preserve the shared ADT project's authentication and unrelated editor sessions. **Connect Relay** binds a fresh adapter to a still-valid selected project. After identity invalidation, **Select ABAP Project** establishes a new selection and uses native login if needed. An interrupted write still requires checking SAP for its actual outcome; clearing local lock bookkeeping does not establish that a mutation was rolled back.
+
 ## Extending a Tool
 
 1. Add or update the Java tool implementation and its `McpTool` schema. Verify existing and new argument combinations, SAP URL construction, SAP session requirements, and failure results. Register it in the Eclipse tool list used by the relay.
@@ -127,7 +135,11 @@ cargo +1.95.0 test --locked --workspace --all-targets && cargo +1.95.0 clippy --
 cargo +1.95.0 build --locked --workspace --bins
 ```
 
-Build the Eclipse modules with Maven 3.10.0, JDK 21, and the parent POM's Tycho 5.0.4. The plugin targets Java 17. Keep the bundled Gson JAR at the plugin root. Tycho uses its `Bundle-ClassPath` entry as a Maven classifier, and a filename without directory separators passes Maven Resolver's default coordinate validation. The [Eclipse build and harness commands](verification.md#eclipse-plugin-build) cover both Java checks. Use the [update site guide](eclipse-update-site.md) to install the result or host it on GitHub Pages.
+Build the Eclipse modules with Maven 3.10.0, JDK 21, and the parent POM's Tycho 5.0.4. The plugin targets Java 17. The build resolves ADT APIs from SAP's public 2024-03 p2 repository alongside the Eclipse target. SAP ADT must also be installed in the runtime Eclipse environment. Keep the bundled Gson JAR at the plugin root. The [Eclipse build and harness commands](verification.md#eclipse-plugin-build) cover both Java checks. Use the [update site guide](eclipse-update-site.md) to install the result or host it on GitHub Pages.
+
+The reactor's checked-in [`.mvn/maven.config`](../java-plugin/sap-adt-mcp-server/.mvn/maven.config) temporarily sets `-Dmaven.resolver.validation=MILD`. Tycho 5.0.4 assigns SAP's nested JAR paths as Maven classifiers, triggering Maven 3.10.0 coordinate validation. [Tycho issue 6399](https://github.com/eclipse-tycho/tycho/issues/6399) documents this failure and workaround. The [fix in pull request 6400](https://github.com/eclipse-tycho/tycho/pull/6400) is merged but absent from the pinned release; upgrade to a released version containing it and remove this setting together.
+
+`MILD` relaxes coordinate validation to checking uninterpolated placeholders, so this build does not receive Maven's full coordinate safety checks. The setting applies to this reactor's Maven invocation and does not alter runtime TLS, certificate verification, or relay policy. Keep it out of user-wide Maven settings. Include the hidden `.mvn/maven.config` file in CI checkouts and source archives, and use the documented reactor command. [Maven 3.10.0 release notes](https://maven.apache.org/docs/3.10.0/release-notes.html)
 
 The first check resolves a lockfile when needed. Keep the tested resolution for the subsequent locked commands. Use one workspace-wide run per additional supported feature set. The Rust integration tests can exercise the binaries with a simulated Eclipse peer. Live Eclipse, SAP authorization, package metadata, and visual inspection need the environment and screenshots described in the [verification checklist](verification.md). Inspect logs for a running server and obtain the owner's confirmation of a quiet machine before benchmark or timing work.
 
