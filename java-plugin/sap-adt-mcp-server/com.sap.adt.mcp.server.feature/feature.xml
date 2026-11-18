@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feature
+      id="com.sap.adt.mcp.server.feature"
+   label="SAP ADT MCP Relay"
+      version="1.0.0.qualifier"
+      provider-name="SAP ADT MCP">
+
+   <description>
+      Connects Eclipse to the company relay over mutual TLS and executes
+      approved desktop clients' tool calls using the active SAP connection.
+   </description>
+
+   <copyright>
+      Copyright (c) 2024 SAP ADT MCP
+   </copyright>
+
+   <license url="http://www.apache.org/licenses/LICENSE-2.0">
+      Apache License, Version 2.0
+   </license>
+
+   <plugin
+         id="com.sap.adt.mcp.server.plugin"
+         download-size="0"
+         install-size="0"
+         version="0.0.0"
+         unpack="false"/>
+
+</feature>
