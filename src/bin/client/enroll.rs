@@ -6,19 +6,18 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
-use reqwest::Response;
 use ring::{
     digest,
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use trillium_client::Status;
 use zeroize::Zeroizing;
 
 use super::transport::{
     Credentials, MAX_CREDENTIAL_BYTES, PROFILE_NAME, Profile, certificate, endpoint, https_client,
-    read_body,
 };
-use crate::{bootstrap, storage, token};
+use crate::{bootstrap, https::Response, storage, token};
 
 #[derive(Deserialize)]
 struct Approval {
@@ -54,12 +53,12 @@ fn operator_token() -> Result<Zeroizing<String>> {
 }
 
 /// Local wording for the relay's refusal codes (see `REFUSED_*` in `src/enrollment.rs`).
-fn refusal(status: reqwest::StatusCode, body: &[u8]) -> String {
+fn refusal(status: Status, body: &[u8]) -> String {
     match (status, body) {
-        (reqwest::StatusCode::FORBIDDEN, b"registration-closed") => {
+        (Status::Forbidden, b"registration-closed") => {
             "Registration is closed on the relay. Ask the operator to open registration, then enroll again.".into()
         }
-        (reqwest::StatusCode::FORBIDDEN, b"request-denied") => {
+        (Status::Forbidden, b"request-denied") => {
             "The operator denied this request, or closed registration while it waited. Enroll again.".into()
         }
         _ => format!("Enrollment returned HTTP {status}."),
@@ -69,10 +68,10 @@ fn refusal(status: reqwest::StatusCode, body: &[u8]) -> String {
 async fn reply<T: DeserializeOwned>(response: Response) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
-        let body = read_body(response, 256).await.unwrap_or_default();
+        let body = response.bytes(256).await.unwrap_or_default();
         anyhow::bail!(refusal(status, &body));
     }
-    let data = read_body(response, MAX_CREDENTIAL_BYTES).await?;
+    let data = response.bytes(MAX_CREDENTIAL_BYTES).await?;
     serde_json::from_slice(&data).map_err(|_| anyhow!("Invalid enrollment response."))
 }
 
@@ -100,7 +99,7 @@ async fn request_profile(server: &str, enrollment: &str, label: &str) -> Result<
     );
     let ca = certificate(approval.ca_pem.as_bytes())?;
     let pin = digest::digest(&digest::SHA256, ca.as_ref());
-    let grant = tokio::task::spawn_blocking(operator_token).await??;
+    let grant = smol::unblock(operator_token).await?;
     let decoded =
         token::decode(&grant).context("The operator supplied an invalid enrollment token.")?;
     ensure!(
@@ -168,16 +167,14 @@ pub async fn run(server: &str, enrollment: &str, label: &str, directory: &Path) 
 #[cfg(test)]
 mod tests {
     use super::refusal;
-    use reqwest::StatusCode;
+    use trillium_client::Status;
 
     #[test]
     fn refusal_codes_get_actionable_messages() {
-        assert!(
-            refusal(StatusCode::FORBIDDEN, b"registration-closed").contains("open registration")
-        );
-        assert!(refusal(StatusCode::FORBIDDEN, b"request-denied").contains("denied"));
+        assert!(refusal(Status::Forbidden, b"registration-closed").contains("open registration"));
+        assert!(refusal(Status::Forbidden, b"request-denied").contains("denied"));
         assert_eq!(
-            refusal(StatusCode::FORBIDDEN, b"other"),
+            refusal(Status::Forbidden, b"other"),
             "Enrollment returned HTTP 403 Forbidden."
         );
     }

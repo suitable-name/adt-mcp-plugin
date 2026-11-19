@@ -1,5 +1,5 @@
 use std::{
-    io,
+    io::{self, Stdout},
     path::Path,
     sync::{
         Arc,
@@ -9,20 +9,19 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
-use reqwest::{
-    Client, RequestBuilder, StatusCode, Url,
-    header::{ACCEPT, CONTENT_TYPE, HeaderValue},
-};
 use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Stdout},
-    sync::Mutex,
-    task::JoinSet,
+use smol::{
+    Task, Unblock,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    lock::Mutex,
 };
+use trillium_client::{HeaderValue, KnownHeaderName, Method, Status, Url};
 
 use crate::{
     endpoints,
-    transport::{Profile, read_body},
+    https::{Client, RequestBuilder},
+    rt,
+    transport::Profile,
 };
 
 const MAX_REQUEST: usize = 4 * 1024 * 1024;
@@ -30,7 +29,8 @@ const MAX_RESPONSE: usize = 9 * 1024 * 1024;
 const MAX_CONCURRENT: usize = 16;
 const SESSION_ID: &str = "mcp-session-id";
 const VERSION: &str = "mcp-protocol-version";
-type Output = Arc<Mutex<Stdout>>;
+type Output = Arc<Mutex<Unblock<Stdout>>>;
+type Jobs = Vec<Task<Result<()>>>;
 
 #[derive(Clone)]
 struct Remote {
@@ -61,13 +61,13 @@ impl Remote {
         Ok(Self {
             http,
             url,
-            endpoint: selection.parse()?,
+            endpoint: HeaderValue::from(selection),
         })
     }
 
-    fn request(&self, method: reqwest::Method) -> RequestBuilder {
+    fn request(&self, method: Method) -> RequestBuilder {
         self.http
-            .request(method, self.url.clone())
+            .request(method, &self.url)
             .header("x-sap-adt-endpoint", self.endpoint.clone())
     }
 }
@@ -88,12 +88,11 @@ impl Session {
 
     async fn close(&self, target: &Remote) {
         let request = self
-            .headers(target.request(reqwest::Method::DELETE))
+            .headers(target.request(Method::Delete))
             .timeout(Duration::from_secs(5));
         match request.send().await {
             Ok(response)
-                if response.status().is_success() || response.status() == StatusCode::NOT_FOUND => {
-            }
+                if response.status().is_success() || response.status() == Status::NotFound => {}
             _ => eprintln!("Could not close the remote MCP session."),
         }
     }
@@ -126,9 +125,12 @@ async fn post(
     initialize: bool,
 ) -> Result<Reply> {
     let request = remote
-        .request(reqwest::Method::POST)
-        .header(ACCEPT, "application/json, text/event-stream")
-        .header(CONTENT_TYPE, "application/json")
+        .request(Method::Post)
+        .header(
+            KnownHeaderName::Accept,
+            "application/json, text/event-stream",
+        )
+        .header(KnownHeaderName::ContentType, "application/json")
         .body(bytes);
     let request = match session {
         Some(active) => active.headers(request),
@@ -140,13 +142,13 @@ async fn post(
         .context("Could not reach the relay over mutual TLS.")?;
     let status = response.status();
     if let Some(session) = session
-        && status == StatusCode::NOT_FOUND
+        && status == Status::NotFound
     {
         session.expired.store(true, Ordering::Release);
     }
     let Some(id) = id else {
         ensure!(
-            status == StatusCode::ACCEPTED,
+            status == Status::Accepted,
             "The relay rejected a notification (HTTP {status})."
         );
         return Ok(Reply {
@@ -154,17 +156,15 @@ async fn post(
             new_session: None,
         });
     };
-    let session_id = response.headers().get(SESSION_ID).cloned();
+    let session_id = response.header(SESSION_ID).map(str::to_owned);
     ensure!(
         response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|header| header.to_str().ok())
+            .header(KnownHeaderName::ContentType)
             .and_then(|header| header.split(';').next())
             .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json")),
         "The relay returned an unexpected content type (HTTP {status})."
     );
-    let bytes = read_body(response, MAX_RESPONSE).await?;
+    let bytes = response.bytes(MAX_RESPONSE).await?;
     let message: Value =
         serde_json::from_slice(&bytes).map_err(|_| anyhow!("Invalid JSON from the relay."))?;
     ensure!(
@@ -181,20 +181,20 @@ async fn post(
     let new_session = if initialize && message.get("result").is_some() {
         let assigned_id = session_id.context("The relay did not issue a session ID.")?;
         ensure!(
-            !assigned_id.as_bytes().is_empty(),
+            !assigned_id.is_empty(),
             "The relay issued an empty session ID."
         );
         let version = message["result"]["protocolVersion"]
             .as_str()
             .context("The relay did not negotiate a protocol version.")?
-            .parse()?;
+            .to_owned();
         let session = Session {
-            id: assigned_id,
-            version,
+            id: HeaderValue::from(assigned_id),
+            version: HeaderValue::from(version),
             expired: Arc::new(AtomicBool::new(false)),
         };
         let confirmed = message["result"]["_meta"]["com.sap.adt.mcp/endpoint"].as_str();
-        if confirmed.map(str::as_bytes) != Some(remote.endpoint.as_bytes()) {
+        if confirmed != remote.endpoint.as_str() {
             session.close(remote).await;
             let error = rpc_error(
                 id,
@@ -247,17 +247,28 @@ async fn exchange(
     }
 }
 
+/// Await the jobs that have already finished so their errors surface promptly.
+async fn reap(jobs: &mut Jobs) -> Result<()> {
+    let mut index = 0;
+    while index < jobs.len() {
+        if jobs[index].is_finished() {
+            jobs.swap_remove(index).await?;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
 async fn messages(
     connection: Result<&Remote, &str>,
     session: &mut Option<Session>,
-    jobs: &mut JoinSet<Result<()>>,
+    jobs: &mut Jobs,
 ) -> Result<()> {
-    let output = Arc::new(Mutex::new(tokio::io::stdout()));
-    let mut input = BufReader::new(tokio::io::stdin());
+    let output = Arc::new(Mutex::new(Unblock::new(io::stdout())));
+    let mut input = BufReader::new(Unblock::new(io::stdin()));
     loop {
-        while let Some(done) = jobs.try_join_next() {
-            done??;
-        }
+        reap(jobs).await?;
         let mut bytes = Vec::new();
         let length = (&mut input)
             .take(MAX_REQUEST as u64 + 2)
@@ -342,10 +353,10 @@ async fn messages(
             .await?;
         } else {
             let (target, active, sink) = (remote.clone(), current.clone(), output.clone());
-            jobs.spawn(async move {
+            jobs.push(rt::spawn(async move {
                 let _ = exchange(&target, Some(&active), bytes, &message, &sink).await?;
                 Ok(())
-            });
+            }));
         }
     }
 }
@@ -356,14 +367,13 @@ pub async fn run(directory: Option<&Path>) -> Result<()> {
     if let Err(reason) = connection {
         eprintln!("{reason}");
     }
-    let mut jobs = JoinSet::new();
+    let mut jobs = Jobs::new();
     let mut session = None;
     let mut outcome = messages(connection, &mut session, &mut jobs).await;
-    while let Some(done) = jobs.join_next().await {
+    for job in jobs {
+        let result = job.await;
         if outcome.is_ok() {
-            outcome = done
-                .context("An MCP request failed to complete.")
-                .and_then(|result| result);
+            outcome = result;
         }
     }
     if let (Some(session), Ok(target)) = (session, connection) {

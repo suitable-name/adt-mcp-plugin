@@ -2,10 +2,11 @@ use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use trillium_client::Method;
 
 use crate::{
     storage,
-    transport::{Profile, read_body, read_file},
+    transport::{Profile, read_file},
 };
 
 const SELECTION_FILE: &str = "endpoint.json";
@@ -46,13 +47,17 @@ async fn available(directory: &Path) -> Result<Vec<Endpoint>> {
     let (client, mut url) = Profile::load(directory)?.connection()?;
     url.set_path("/endpoints");
     let reply = client
-        .get(url)
+        .request(Method::Get, url)
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .context("Could not retrieve assigned endpoints over mutual TLS.")?
-        .error_for_status()?;
-    let bytes = read_body(reply, 4 * 1024 * 1024).await?;
+        .context("Could not retrieve assigned endpoints over mutual TLS.")?;
+    let status = reply.status();
+    ensure!(
+        status.is_success(),
+        "The relay returned HTTP {status} for the endpoint list."
+    );
+    let bytes = reply.bytes(4 * 1024 * 1024).await?;
     let list: Listing =
         serde_json::from_slice(&bytes).context("Invalid endpoint list from the relay.")?;
     ensure!(

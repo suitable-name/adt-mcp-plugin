@@ -1,22 +1,29 @@
 use std::{fs, net::SocketAddr, path::Path, process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use futures_util::{SinkExt, StreamExt};
-use reqwest::{Client, StatusCode};
+use async_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
+use futures_rustls::{TlsConnector, client::TlsStream};
+use futures_util::StreamExt;
 use rustls::{ClientConfig, RootCertStore, crypto::ring, pki_types::ServerName};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::{
+use smol::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     net::TcpStream,
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    time::timeout,
 };
-use tokio_rustls::{TlsConnector, client::TlsStream};
-use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message};
+use trillium_client::Status;
 
+use rt::timeout;
+
+#[path = "../src/rt.rs"]
+mod rt;
+// https.rs is shared with the client binary; the tests use only a subset of it.
 #[path = "support/endpoints.rs"]
 mod endpoints;
+#[path = "../src/https.rs"]
+#[allow(dead_code)]
+mod https;
 #[path = "support/operator.rs"]
 mod operator;
 #[path = "support/terminal.rs"]
@@ -45,7 +52,8 @@ fn process(binary: &str) -> Command {
 
 async fn matching_log(logs: &mut Logs, marker: &'static str) -> Result<String> {
     timeout(Duration::from_secs(15), async {
-        while let Some(line) = logs.next_line().await? {
+        while let Some(line) = logs.next().await {
+            let line = line?;
             if line.contains(marker) {
                 return Ok(line);
             }
@@ -95,7 +103,7 @@ impl Registration {
             .status()
             .await?;
         ensure!(status.success(), "Server initialization failed.");
-        let mut operator = Operator::start(SERVER, pki)?;
+        let operator = Operator::start(SERVER, pki)?;
         operator.visible("Enrollment").await?;
         operator.keys(b"\t\t\t")?;
         let screen = operator.visible("Enrollment listening on").await?;
@@ -109,7 +117,7 @@ impl Registration {
         })
     }
 
-    async fn enroll_desktop(&mut self, profile: &Path, label: &str, wrong_ca: bool) -> Result<()> {
+    async fn enroll_desktop(&self, profile: &Path, label: &str, wrong_ca: bool) -> Result<()> {
         let mut child = process(DESKTOP)
             .args([
                 "enroll",
@@ -167,25 +175,29 @@ impl Registration {
         if wrong_ca {
             matching_log(&mut logs, "different CA").await?;
             ensure!(
-                !child.wait().await?.success() && !profile.exists(),
+                !child.status().await?.success() && !profile.exists(),
                 "Rejected identity was persisted."
             );
         } else {
             matching_log(&mut logs, "Client profile saved.").await?;
-            ensure!(child.wait().await?.success(), "Desktop enrollment failed.");
+            ensure!(
+                child.status().await?.success(),
+                "Desktop enrollment failed."
+            );
         }
         Ok(())
     }
 
-    async fn eclipse_identity(&mut self, http: &Client, label: &str) -> Result<Identity> {
+    async fn eclipse_identity(&self, http: &https::Client, label: &str) -> Result<Identity> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let body = json!({"id": id, "label": label, "role": "eclipse"});
         let request = http
             .post(format!("https://{}/request", self.enrollment))
             .json(&body);
-        let submit = tokio::spawn(async move { request.send().await });
+        // The task is cancelled if dropped, so it stays bound until awaited.
+        let submit = rt::spawn(async move { request.send().await });
         let token = self.operator.approve(&id).await?;
-        let approval: Value = submit.await??.error_for_status()?.json().await?;
+        let approval: Value = submit.await?.error_for_status()?.json().await?;
         assert_eq!(approval["id"], id);
         ensure!(
             approval["ca_pem"].is_string() && approval.get("token").is_none(),
@@ -203,7 +215,7 @@ impl Registration {
             .await?;
         assert_eq!(
             http.post(claim).json(&grant).send().await?.status(),
-            StatusCode::FORBIDDEN
+            Status::Forbidden
         );
         Ok(identity)
     }
@@ -237,15 +249,48 @@ fn tls(mut ca: &[u8], identity: Option<&Identity>) -> Result<ClientConfig> {
     }
 }
 
-fn http(config: ClientConfig) -> Result<Client> {
-    Ok(Client::builder()
-        .use_preconfigured_tls(config)
-        .no_proxy()
-        .build()?)
+fn http(config: ClientConfig) -> https::Client {
+    https::Client::new(config)
+}
+
+/// The few `reqwest::Response` conveniences the tests rely on.
+trait ResponseExt: Sized {
+    fn error_for_status(self) -> Result<Self>;
+    async fn text(self) -> Result<String>;
+    async fn json<T: DeserializeOwned>(self) -> Result<T>;
+}
+
+/// Largest response body the tests accept.
+const BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+impl ResponseExt for https::Response {
+    fn error_for_status(self) -> Result<Self> {
+        let status = self.status();
+        ensure!(
+            !status.is_client_error() && !status.is_server_error(),
+            "HTTP status {status}."
+        );
+        Ok(self)
+    }
+
+    async fn text(self) -> Result<String> {
+        let bytes = self.bytes(BODY_LIMIT).await?;
+        Ok(String::from_utf8(bytes.to_vec())?)
+    }
+
+    async fn json<T: DeserializeOwned>(self) -> Result<T> {
+        let bytes = self.bytes(BODY_LIMIT).await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
 }
 
 async fn connect_bridge(config: &ClientConfig, server: &mut Server) -> Result<Socket> {
-    let stream = TcpStream::connect(server.data).await?;
+    // async-io marks the sockets it connects as inheritable on Windows, so desktop
+    // processes spawned later would hold this connection open after the test drops
+    // it. `std` sockets are not inheritable.
+    let address = server.data;
+    let stream =
+        TcpStream::try_from(smol::unblock(move || std::net::TcpStream::connect(address)).await?)?;
     let connector = TlsConnector::from(Arc::new(config.clone()));
     let tls = connector
         .connect(ServerName::from(server.data.ip()), stream)
@@ -303,9 +348,9 @@ impl Desktop {
     async fn reply(&mut self, id: u64) -> Result<Value> {
         let line = self
             .stdout
-            .next_line()
-            .await?
-            .context("Missing desktop response.")?;
+            .next()
+            .await
+            .context("Missing desktop response.")??;
         let reply: Value = serde_json::from_str(&line)?;
         assert_eq!(reply["id"], id);
         Ok(reply)
@@ -378,7 +423,7 @@ async fn roundtrip(profile: &Path, server: &mut Server, config: &ClientConfig) -
     assert!(desk.reply(5).await?["error"]["message"].is_string());
     drop(desk.stdin);
     ensure!(
-        desk.child.wait().await?.success(),
+        desk.child.status().await?.success(),
         "Desktop failed to shut down."
     );
     Ok(())
@@ -389,9 +434,9 @@ async fn scenario() -> Result<()> {
     let pki = directory.path().join("pki");
     let profile = directory.path().join("desktop");
     let bob = directory.path().join("bob");
-    let mut registration = Registration::start(&pki).await?;
+    let registration = Registration::start(&pki).await?;
     let ca = fs::read(pki.join("ca.pem"))?;
-    let bootstrap = http(tls(&ca, None)?)?;
+    let bootstrap = http(tls(&ca, None)?);
     let request =
         json!({"id":"11111111111111111111111111111111","role":"desktop","label":"Closed"});
     let denied = bootstrap
@@ -399,7 +444,7 @@ async fn scenario() -> Result<()> {
         .json(&request)
         .send()
         .await?;
-    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(denied.status(), Status::Forbidden);
     assert_eq!(denied.text().await?, "registration-closed");
     // The operator sees that a request was turned away while closed.
     registration
@@ -434,7 +479,7 @@ async fn scenario() -> Result<()> {
         .await?;
     registration.operator.keys(b"\x15Z_TEST*\rs")?;
     registration.operator.visible("Access rules saved.").await?;
-    endpoints::assign_workspaces(&mut registration.operator).await?;
+    endpoints::assign_workspaces(&registration.operator).await?;
     let data = registration.data;
     let enrollment = registration.enrollment;
     drop(registration);
@@ -461,12 +506,12 @@ async fn scenario() -> Result<()> {
     );
     let mut server = Server { child, logs, data };
     let config = tls(&ca, Some(&eclipse))?;
-    let denied = http(config.clone())?
+    let denied = http(config.clone())
         .post(mcp)
         .json(&json!({}))
         .send()
         .await?;
-    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(denied.status(), Status::Forbidden);
     endpoints::exercise_isolation(
         &mut server,
         &ca,
@@ -476,13 +521,16 @@ async fn scenario() -> Result<()> {
     )
     .await?;
     roundtrip(&profile, &mut server, &config).await?;
-    server.child.kill().await?;
+    server.child.kill()?;
     Ok(())
 }
 
-#[tokio::test]
-async fn enrolled_desktop_reaches_only_its_live_eclipse_session() -> Result<()> {
-    timeout(Duration::from_secs(180), scenario())
-        .await
-        .context("Desktop relay scenario timed out.")?
+#[test]
+fn enrolled_desktop_reaches_only_its_live_eclipse_session() -> Result<()> {
+    smol::block_on(async {
+        // The whole scenario's state machine is large; keep it on the heap.
+        Box::pin(timeout(Duration::from_secs(180), scenario()))
+            .await
+            .context("Desktop relay scenario timed out.")?
+    })
 }

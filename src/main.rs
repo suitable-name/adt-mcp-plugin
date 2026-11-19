@@ -4,29 +4,26 @@ mod enrollment;
 mod logs;
 mod mcp;
 mod policy;
+mod rt;
 mod security;
 mod transport;
 mod tui;
+mod web;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use axum::{
-    Extension, Router,
-    extract::{DefaultBodyLimit, Request, State},
-    http::{StatusCode, header},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-};
 use clap::{Parser, Subcommand};
-use tokio::{net::TcpListener, time::timeout};
+use smol::net::TcpListener;
 use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter};
+use trillium_http::{KnownHeaderName, Method, Status};
 
-use bridge::Registry;
+use bridge::{Bridge, Registry};
 use policy::PolicyStore;
+use rt::timeout;
 use security::Pki;
-use transport::PeerCertificate;
+use transport::{Conn, Handoff, Peer, PeerCertificate, Service, Upgrade};
+use web::Reply;
 
 #[derive(Parser)]
 #[command(
@@ -71,8 +68,12 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    smol::block_on(async_main())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn async_main() -> Result<()> {
     let args = Args::parse();
     let logs = logs::Logs::default();
     let writer = if matches!(
@@ -125,7 +126,7 @@ async fn main() -> Result<()> {
             let policy = Arc::new(policy::PolicyStore::load(&pki)?);
             let pki = Arc::new(identity);
             let tls = pki.data_tls()?;
-            let router = data_routes(Arc::clone(&pki), Arc::clone(&policy));
+            let relay = Relay::new(Arc::clone(&pki), Arc::clone(&policy));
             let enrollment = enrollment::Enrollment::new(Arc::clone(&pki), issue_token);
             let network_enrollment = enrollment.clone();
             let service = async move {
@@ -145,15 +146,30 @@ async fn main() -> Result<()> {
                         tracing::info!("Headless mode. Registration is closed.");
                     }
                 }
-                tokio::select! {
-                    result = transport::listen(socket, tls, 128, router) => result,
-                    result = enrollment::run(enrollment_listen, network_enrollment, !headless || issue_token) => result,
-                    result = tokio::signal::ctrl_c() => {
-                        result.context("Receiving the shutdown signal")?;
-                        tracing::info!("Shutting down the relay.");
-                        Ok(())
-                    }
-                }
+                let (stop, stopped) = smol::channel::bounded::<()>(1);
+                ctrlc::set_handler(move || {
+                    let _ = stop.try_send(());
+                })
+                .context("Receiving the shutdown signal")?;
+                smol::future::race(
+                    transport::listen(socket, tls, 128, relay),
+                    smol::future::race(
+                        enrollment::run(
+                            enrollment_listen,
+                            network_enrollment,
+                            !headless || issue_token,
+                        ),
+                        async {
+                            stopped
+                                .recv()
+                                .await
+                                .context("Receiving the shutdown signal")?;
+                            tracing::info!("Shutting down the relay.");
+                            Ok::<(), anyhow::Error>(())
+                        },
+                    ),
+                )
+                .await
             };
             match (headless, issue_token) {
                 (false, _) => tui::run(enrollment, pki, policy, logs, service).await,
@@ -171,50 +187,87 @@ struct Relay {
     policy: Arc<PolicyStore>,
 }
 
-fn data_routes(pki: Arc<Pki>, policy: Arc<PolicyStore>) -> Router {
-    let relay = Relay {
-        registry: Registry::default(),
-        pki: Arc::clone(&pki),
-        policy,
-    };
-    Router::new()
-        .route("/endpoints", get(mcp::endpoints))
-        .route("/mcp", post(mcp::request).delete(mcp::end_session))
-        .route(
-            "/bridge",
-            get(
-                |State(relay): State<Relay>, Extension(cert), ws| async move {
-                    bridge::upgrade(&relay.registry, relay.pki, cert, ws)
-                },
-            ),
-        )
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
-        .route_layer(middleware::from_fn_with_state(pki, authorize))
-        .with_state(relay)
+#[derive(Clone, Copy)]
+enum Route {
+    Endpoints,
+    Mcp,
+    Bridge,
 }
 
-async fn authorize(
-    State(pki): State<Arc<Pki>>,
-    Extension(cert): Extension<PeerCertificate>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if request.headers().contains_key(header::ORIGIN) {
-        return StatusCode::FORBIDDEN.into_response();
+impl Relay {
+    fn new(pki: Arc<Pki>, policy: Arc<PolicyStore>) -> Self {
+        Self {
+            registry: Registry::default(),
+            pki,
+            policy,
+        }
     }
-    let role = match request.uri().path() {
-        "/mcp" | "/endpoints" => "desktop",
-        "/bridge" => "eclipse",
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    if !pki.authorize(&cert.der, role) {
-        return (
-            StatusCode::FORBIDDEN,
-            "This certificate is not enrolled for this endpoint.",
+
+    /// Authorize a request for a known path, then dispatch it on its method.
+    async fn respond(&self, conn: &mut Conn, peer: &Peer, handoff: &Handoff<Bridge>) -> Reply {
+        let (route, role) = match conn.path() {
+            "/mcp" => (Route::Mcp, "desktop"),
+            "/endpoints" => (Route::Endpoints, "desktop"),
+            "/bridge" => (Route::Bridge, "eclipse"),
+            _ => return Status::NotFound.into(),
+        };
+        // Only an authenticated TLS handshake yields a peer certificate.
+        let Some(cert) = &peer.cert else {
+            return Status::InternalServerError.into();
+        };
+        if conn.request_headers().has_header(KnownHeaderName::Origin) {
+            return Status::Forbidden.into();
+        }
+        if !self.pki.authorize(&cert.der, role) {
+            return Reply::text(
+                Status::Forbidden,
+                "This certificate is not enrolled for this endpoint.",
+            );
+        }
+        timeout(
+            Duration::from_secs(615),
+            self.dispatch(conn, route, cert, handoff),
         )
-            .into_response();
-    }
-    timeout(Duration::from_secs(615), next.run(request))
         .await
-        .unwrap_or_else(|_| StatusCode::REQUEST_TIMEOUT.into_response())
+        .unwrap_or_else(|_| Status::RequestTimeout.into())
+    }
+
+    async fn dispatch(
+        &self,
+        conn: &mut Conn,
+        route: Route,
+        cert: &PeerCertificate,
+        handoff: &Handoff<Bridge>,
+    ) -> Reply {
+        match (route, conn.method()) {
+            (Route::Endpoints, Method::Get) => mcp::endpoints(self, cert).await,
+            (Route::Mcp, Method::Post) => mcp::request(self, cert, conn).await,
+            (Route::Mcp, Method::Delete) => {
+                mcp::end_session(self, cert, conn.request_headers()).await
+            }
+            (Route::Bridge, Method::Get) => {
+                let (reply, bridge) = bridge::upgrade(&self.registry, conn.request_headers(), cert);
+                if let Some(bridge) = bridge {
+                    handoff.set(bridge);
+                }
+                reply
+            }
+            _ => Status::MethodNotAllowed.into(),
+        }
+    }
+}
+
+impl Service for Relay {
+    type Pending = Bridge;
+
+    async fn handle(&self, mut conn: Conn, peer: &Peer, handoff: &Handoff<Bridge>) -> Conn {
+        let reply = self.respond(&mut conn, peer, handoff).await;
+        reply.into_conn(conn)
+    }
+
+    async fn upgrade(&self, upgrade: Upgrade, peer: &Peer, pending: Option<Bridge>) {
+        if let (Some(bridge), Some(cert)) = (pending, &peer.cert) {
+            bridge::serve_upgraded(upgrade, bridge, &self.pki, cert).await;
+        }
+    }
 }

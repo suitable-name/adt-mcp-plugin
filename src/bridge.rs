@@ -4,21 +4,30 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{security::Pki, transport::PeerCertificate};
-use axum::{
-    extract::{
-        WebSocketUpgrade,
-        ws::{Message, WebSocket},
+use crate::{
+    rt::timeout,
+    security::Pki,
+    transport::{PeerCertificate, Transport, Upgrade},
+    web::{Prefixed, Reply},
+};
+use async_tungstenite::{
+    WebSocketStream,
+    tungstenite::{
+        Message,
+        handshake::derive_accept_key,
+        protocol::{Role, WebSocketConfig},
     },
-    http::StatusCode,
-    response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
-    time::{Instant as Deadline, timeout_at},
+use smol::{
+    Timer, channel, future,
+    lock::{Semaphore, SemaphoreGuardArc},
 };
+use trillium_http::{Headers, KnownHeaderName, Status};
 use uuid::Uuid;
+
+type Socket = WebSocketStream<Prefixed<Transport>>;
 
 const CALL_LIMIT: Duration = Duration::from_secs(600);
 const HEARTBEAT: Duration = Duration::from_secs(20);
@@ -54,21 +63,21 @@ fn lost_reply(method: &str) -> Value {
 struct Call {
     method: &'static str,
     params: Value,
-    reply: oneshot::Sender<Outcome>,
-    deadline: Deadline,
-    _permit: OwnedSemaphorePermit,
+    reply: channel::Sender<Outcome>,
+    deadline: Instant,
+    _permit: SemaphoreGuardArc,
 }
 
 #[derive(Clone)]
 pub struct Client {
     pub(super) endpoint: Arc<str>,
-    sender: mpsc::Sender<Call>,
+    sender: channel::Sender<Call>,
     admission: Arc<Semaphore>,
 }
 
 impl Client {
-    fn channel(endpoint: Arc<str>) -> (Self, mpsc::Receiver<Call>) {
-        let (sender, receiver) = mpsc::channel(1);
+    fn channel(endpoint: Arc<str>) -> (Self, channel::Receiver<Call>) {
+        let (sender, receiver) = channel::bounded(1);
         (
             Self {
                 endpoint,
@@ -84,13 +93,13 @@ impl Client {
         method: &'static str,
         params: Value,
         result: Value,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
-        let (client, mut receiver) = Self::channel(Arc::from("test"));
-        let task = tokio::spawn(async move {
+    ) -> (Self, smol::Task<()>) {
+        let (client, receiver) = Self::channel(Arc::from("test"));
+        let task = crate::rt::spawn(async move {
             let call = receiver.recv().await.unwrap();
             assert_eq!(call.method, method);
             assert_eq!(call.params, params);
-            call.reply.send(Ok(result)).unwrap();
+            call.reply.try_send(Ok(result)).unwrap();
         });
         (client, task)
     }
@@ -98,11 +107,10 @@ impl Client {
     pub(super) async fn call(&self, method: &'static str, params: Value) -> Outcome {
         let permit = self
             .admission
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| error(-32_000, "The Eclipse bridge is busy."))?;
-        let (reply, result) = oneshot::channel();
-        let deadline = Deadline::now() + CALL_LIMIT;
+            .try_acquire_arc()
+            .ok_or_else(|| error(-32_000, "The Eclipse bridge is busy."))?;
+        let (reply, result) = channel::bounded(1);
+        let deadline = Instant::now() + CALL_LIMIT;
         self.sender
             .try_send(Call {
                 method,
@@ -112,10 +120,13 @@ impl Client {
                 _permit: permit,
             })
             .map_err(|_| disconnected())?;
-        timeout_at(deadline, result)
-            .await
-            .map_err(|_| lost_reply(method))?
-            .map_err(|_| lost_reply(method))?
+        timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            result.recv(),
+        )
+        .await
+        .map_err(|_| lost_reply(method))?
+        .map_err(|_| lost_reply(method))?
     }
 }
 
@@ -138,14 +149,14 @@ struct Slot {
 }
 
 impl Slot {
-    fn initialize(&mut self, version: &'static str, owner: [u8; 32]) -> Result<Uuid, StatusCode> {
+    fn initialize(&mut self, version: &'static str, owner: [u8; 32]) -> Result<Uuid, Status> {
         if !self.ready {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
+            return Err(Status::ServiceUnavailable);
         }
         self.sessions
             .retain(|_, session| session.last_used.elapsed() < SESSION_IDLE);
         if self.sessions.len() >= MAX_SESSIONS {
-            return Err(StatusCode::TOO_MANY_REQUESTS);
+            return Err(Status::TooManyRequests);
         }
         let id = Uuid::new_v4();
         self.sessions.insert(
@@ -159,12 +170,12 @@ impl Slot {
         Ok(id)
     }
 
-    fn session(&self, id: Uuid, owner: &[u8; 32]) -> Result<(Client, &'static str), StatusCode> {
+    fn session(&self, id: Uuid, owner: &[u8; 32]) -> Result<(Client, &'static str), Status> {
         let session = self
             .sessions
             .get(&id)
             .filter(|s| s.valid(owner))
-            .ok_or(StatusCode::NOT_FOUND)?;
+            .ok_or(Status::NotFound)?;
         Ok((self.bridge.clone(), session.version))
     }
 }
@@ -180,15 +191,15 @@ impl Registry {
     fn reserve(
         &self,
         endpoint: Arc<str>,
-    ) -> Result<(Reservation, mpsc::Receiver<Call>), StatusCode> {
+    ) -> Result<(Reservation, channel::Receiver<Call>), Status> {
         let mut slots = self.slots();
         let full = slots.len() >= MAX_BRIDGES;
         let std::collections::hash_map::Entry::Vacant(slot) = slots.entry(Arc::clone(&endpoint))
         else {
-            return Err(StatusCode::CONFLICT);
+            return Err(Status::Conflict);
         };
         if full {
-            return Err(StatusCode::TOO_MANY_REQUESTS);
+            return Err(Status::TooManyRequests);
         }
         let (bridge, receiver) = Client::channel(Arc::clone(&endpoint));
         slot.insert(Slot {
@@ -215,10 +226,10 @@ impl Registry {
         endpoint: &str,
         version: &'static str,
         owner: [u8; 32],
-    ) -> Result<Uuid, StatusCode> {
+    ) -> Result<Uuid, Status> {
         self.slots()
             .get_mut(endpoint)
-            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+            .ok_or(Status::ServiceUnavailable)?
             .initialize(version, owner)
     }
 
@@ -227,14 +238,14 @@ impl Registry {
         endpoint: Option<&str>,
         id: Uuid,
         owner: &[u8; 32],
-    ) -> Result<(Client, &'static str), StatusCode> {
+    ) -> Result<(Client, &'static str), Status> {
         let slots = self.slots();
         let slot = endpoint
             .map_or_else(
                 || slots.values().find(|slot| slot.sessions.contains_key(&id)),
                 |endpoint| slots.get(endpoint),
             )
-            .ok_or(StatusCode::NOT_FOUND)?;
+            .ok_or(Status::NotFound)?;
         slot.session(id, owner)
     }
 
@@ -244,14 +255,14 @@ impl Registry {
         client: &Client,
         id: Uuid,
         owner: &[u8; 32],
-    ) -> Result<(), StatusCode> {
+    ) -> Result<(), Status> {
         let mut slots = self.slots();
         let session = slots
             .get_mut(&client.endpoint)
             .filter(|slot| slot.bridge.sender.same_channel(&client.sender))
             .and_then(|slot| slot.sessions.get_mut(&id))
             .filter(|session| session.valid(owner))
-            .ok_or(StatusCode::NOT_FOUND)?;
+            .ok_or(Status::NotFound)?;
         session.last_used = Instant::now();
         Ok(())
     }
@@ -284,48 +295,113 @@ impl Drop for Reservation {
     }
 }
 
+/// A reserved bridge slot waiting for its WebSocket upgrade to complete.
+pub struct Bridge {
+    reservation: Reservation,
+    calls: channel::Receiver<Call>,
+}
+
+/// Validate a `/bridge` request (GET only; the caller checks the method) and
+/// answer it. When the answer is `101`, the returned [`Bridge`] must be passed
+/// to [`serve_upgraded`] once the response has been sent.
 pub fn upgrade(
     registry: &Registry,
-    pki: Arc<Pki>,
-    cert: PeerCertificate,
-    ws: WebSocketUpgrade,
-) -> Response {
+    headers: &Headers,
+    cert: &PeerCertificate,
+) -> (Reply, Option<Bridge>) {
+    let accept = match handshake(headers) {
+        Ok(accept) => accept,
+        Err(message) => return (Reply::text(Status::BadRequest, message), None),
+    };
     let (reservation, calls) = match registry.reserve(Arc::from(hex::encode(cert.fingerprint))) {
         Ok(connection) => connection,
-        Err(StatusCode::CONFLICT) => {
+        Err(Status::Conflict) => {
             return (
-                StatusCode::CONFLICT,
-                "This Eclipse endpoint is already connected.",
-            )
-                .into_response();
+                Reply::text(
+                    Status::Conflict,
+                    "This Eclipse endpoint is already connected.",
+                ),
+                None,
+            );
         }
         Err(status) => {
             return (
-                status,
-                "The relay has reached its Eclipse connection limit.",
-            )
-                .into_response();
+                Reply::text(
+                    status,
+                    "The relay has reached its Eclipse connection limit.",
+                ),
+                None,
+            );
         }
     };
-    ws.max_message_size(8 * 1024 * 1024)
-        .max_frame_size(8 * 1024 * 1024)
-        .on_upgrade(move |socket| serve(socket, reservation, calls, pki, cert))
+    let reply = Reply::from(Status::SwitchingProtocols)
+        .with_header(KnownHeaderName::Connection, "upgrade")
+        .with_header(KnownHeaderName::Upgrade, "websocket")
+        .with_header(KnownHeaderName::SecWebsocketAccept, accept);
+    (reply, Some(Bridge { reservation, calls }))
 }
 
-async fn serve(
-    mut socket: WebSocket,
-    reservation: Reservation,
-    mut calls: mpsc::Receiver<Call>,
-    pki: Arc<Pki>,
-    cert: PeerCertificate,
+/// Validates an HTTP/1.1 WebSocket upgrade request, with the checks and
+/// statuses of axum's former `WebSocketUpgrade` extractor. Returns the
+/// `Sec-WebSocket-Accept` value, or the rejection.
+fn handshake(headers: &Headers) -> Result<String, &'static str> {
+    if !headers
+        .token_iter(KnownHeaderName::Connection)
+        .any(|token| token.eq_ignore_ascii_case("upgrade"))
+    {
+        return Err("Connection header did not include `upgrade`");
+    }
+    if !headers.eq_ignore_ascii_case(KnownHeaderName::Upgrade, "websocket") {
+        return Err("`Upgrade` header did not include `websocket`");
+    }
+    let Some(key) = headers.get_str(KnownHeaderName::SecWebsocketKey) else {
+        return Err("`Sec-WebSocket-Key` header missing");
+    };
+    if !headers.eq_ignore_ascii_case(KnownHeaderName::SecWebsocketVersion, "13") {
+        return Err("`Sec-WebSocket-Version` header did not include `13`");
+    }
+    Ok(derive_accept_key(key.as_bytes()))
+}
+
+/// Run the bridge on an upgraded connection.
+pub async fn serve_upgraded(
+    mut upgrade: Upgrade,
+    bridge: Bridge,
+    pki: &Pki,
+    cert: &PeerCertificate,
+) {
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(8 * 1024 * 1024))
+        .max_frame_size(Some(8 * 1024 * 1024));
+    let buffered = upgrade.take_buffer();
+    let io = Prefixed::new(buffered, upgrade.into_transport());
+    let socket = WebSocketStream::from_raw_socket(io, Role::Server, Some(config)).await;
+    serve(socket, bridge, pki, cert).await;
+}
+
+async fn serve(mut socket: Socket, bridge: Bridge, pki: &Pki, cert: &PeerCertificate) {
+    let Bridge { reservation, calls } = bridge;
+    serve_connected(&mut socket, &reservation, &calls, pki, cert).await;
+    // Dropping a closed channel's receiver would leave queued calls (and their
+    // reply senders) alive while a client handle exists, so release them now.
+    calls.close();
+    while calls.try_recv().is_ok() {}
+}
+
+async fn serve_connected(
+    socket: &mut Socket,
+    reservation: &Reservation,
+    calls: &channel::Receiver<Call>,
+    pki: &Pki,
+    cert: &PeerCertificate,
 ) {
     let mut id = 1;
     let hello = exchange(
-        &mut socket,
+        socket,
         id,
         "relay/hello",
         Value::Null,
-        Deadline::now() + HEARTBEAT,
+        Instant::now() + HEARTBEAT,
     )
     .await;
     if !matches!(hello, Ok(Ok(ref capabilities)) if capabilities["policyVersion"].as_u64() == Some(1))
@@ -339,28 +415,55 @@ async fn serve(
     tracing::info!(endpoint = %reservation.endpoint, "Eclipse bridge connected.");
     loop {
         id += 1;
-        tokio::select! {
-            message = socket.recv() => {
+        // `race` polls its futures fairly, like the former `select!`.
+        let event = future::race(
+            async { Event::Socket(socket.next().await) },
+            future::race(
+                async {
+                    match calls.recv().await {
+                        Ok(call) => Event::Call(call),
+                        // No sender is left: only the socket and the heartbeat can wake us.
+                        Err(_) => future::pending().await,
+                    }
+                },
+                async {
+                    Timer::after(HEARTBEAT).await;
+                    Event::Heartbeat
+                },
+            ),
+        )
+        .await;
+        match event {
+            Event::Socket(message) => {
                 if !matches!(message, Some(Ok(Message::Ping(_) | Message::Pong(_)))) {
                     break;
                 }
             }
-            Some(call) = calls.recv() => {
+            Event::Call(call) => {
                 if !pki.authorize(&cert.der, "eclipse") {
-                    let _ = call.reply.send(Err(error(-32_000, "The Eclipse certificate has been revoked.")));
+                    let _ = call.reply.try_send(Err(error(
+                        -32_000,
+                        "The Eclipse certificate has been revoked.",
+                    )));
                     break;
                 }
-                if call.reply.is_closed() || call.deadline <= Deadline::now() {
+                if call.reply.is_closed() || call.deadline <= Instant::now() {
                     continue;
                 }
-                match exchange(&mut socket, id, call.method, call.params, call.deadline).await {
-                    Ok(result) => { let _ = call.reply.send(result); }
+                match exchange(socket, id, call.method, call.params, call.deadline).await {
+                    Ok(result) => {
+                        let _ = call.reply.try_send(result);
+                    }
                     Err(()) => break,
                 }
             }
-            () = tokio::time::sleep(HEARTBEAT) => {
-                if !pki.authorize(&cert.der, "eclipse") ||
-                    !matches!(exchange(&mut socket, id, "ping", Value::Null, Deadline::now() + HEARTBEAT).await, Ok(Ok(_))) {
+            Event::Heartbeat => {
+                if !pki.authorize(&cert.der, "eclipse")
+                    || !matches!(
+                        exchange(socket, id, "ping", Value::Null, Instant::now() + HEARTBEAT).await,
+                        Ok(Ok(_))
+                    )
+                {
                     break;
                 }
             }
@@ -369,26 +472,32 @@ async fn serve(
     tracing::info!(endpoint = %reservation.endpoint, "Eclipse bridge disconnected.");
 }
 
+enum Event {
+    Socket(Option<Result<Message, async_tungstenite::tungstenite::Error>>),
+    Call(Call),
+    Heartbeat,
+}
+
 // Serializing ADT calls also bounds in-flight work. A lost or invalid reply
 // closes this bridge so a later call can never consume an earlier reply.
 async fn exchange(
-    socket: &mut WebSocket,
+    socket: &mut Socket,
     id: u64,
     method: &str,
     params: Value,
-    deadline: Deadline,
+    deadline: Instant,
 ) -> Result<Outcome, ()> {
     let mut request = json!({"jsonrpc": "2.0", "id": id, "method": method});
     if !params.is_null() {
         request["params"] = params;
     }
-    timeout_at(deadline, async {
+    timeout(deadline.saturating_duration_since(Instant::now()), async {
         socket
             .send(Message::Text(request.to_string().into()))
             .await
             .map_err(|_| ())?;
         loop {
-            match socket.recv().await {
+            match socket.next().await {
                 Some(Ok(Message::Text(text))) => return decode_reply(&text, id),
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 _ => return Err(()),
@@ -427,11 +536,11 @@ mod tests {
         let (other, _other_calls) = registry.reserve("other".into()).unwrap();
         assert!(matches!(
             registry.reserve("first".into()),
-            Err(StatusCode::CONFLICT)
+            Err(Status::Conflict)
         ));
         assert_eq!(
             registry.initialize("first", "test", [1; 32]),
-            Err(StatusCode::SERVICE_UNAVAILABLE)
+            Err(Status::ServiceUnavailable)
         );
         first.mark_ready();
         other.mark_ready();
@@ -440,11 +549,11 @@ mod tests {
         let other_id = registry.initialize("other", "test", [1; 32]).unwrap();
         assert!(matches!(
             registry.session(None, id, &[2; 32]),
-            Err(StatusCode::NOT_FOUND)
+            Err(Status::NotFound)
         ));
         assert!(matches!(
             registry.session(Some("other"), id, &[1; 32]),
-            Err(StatusCode::NOT_FOUND)
+            Err(Status::NotFound)
         ));
         let (old_client, _) = registry.session(None, id, &[1; 32]).unwrap();
         assert_eq!(old_client.endpoint.as_ref(), "first");
@@ -453,7 +562,7 @@ mod tests {
         assert_eq!(registry.slots()["first"].sessions[&id].last_used, last_used);
         assert_eq!(
             registry.refresh(&old_client, id, &[2; 32]),
-            Err(StatusCode::NOT_FOUND)
+            Err(Status::NotFound)
         );
         assert!(registry.refresh(&old_client, id, &[1; 32]).is_ok());
         drop(first_calls);
@@ -464,11 +573,11 @@ mod tests {
         assert!(old_client.sender.is_closed());
         assert_eq!(
             registry.refresh(&old_client, id, &[1; 32]),
-            Err(StatusCode::NOT_FOUND)
+            Err(Status::NotFound)
         );
         assert!(matches!(
             registry.session(None, id, &[1; 32]),
-            Err(StatusCode::NOT_FOUND)
+            Err(Status::NotFound)
         ));
         assert!(registry.session(Some("other"), other_id, &[1; 32]).is_ok());
         drop(registry);
@@ -484,11 +593,11 @@ mod tests {
         let id = registry.initialize("0", "test", [1; 32]).unwrap();
         assert!(matches!(
             registry.reserve("0".into()),
-            Err(StatusCode::CONFLICT)
+            Err(Status::Conflict)
         ));
         assert!(matches!(
             registry.reserve("overflow".into()),
-            Err(StatusCode::TOO_MANY_REQUESTS)
+            Err(Status::TooManyRequests)
         ));
         drop(connections.pop());
         let _replacement = registry.reserve("overflow".into()).unwrap();

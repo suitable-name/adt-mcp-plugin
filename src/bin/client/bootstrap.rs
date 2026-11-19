@@ -4,7 +4,6 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
-use reqwest::{Response, Url};
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error, RootCertStore, SignatureScheme,
     client::{
@@ -15,8 +14,10 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use serde::Serialize;
+use trillium_client::Url;
 
 use super::transport::http_client;
+use crate::https::Response;
 
 #[derive(Debug)]
 struct PresentedRoot(Arc<CryptoProvider>);
@@ -85,7 +86,7 @@ pub async fn request(endpoint: Url, id: &str, label: &str) -> Result<Response> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PresentedRoot(provider)))
         .with_no_client_auth();
-    Ok(http_client(config)?
+    http_client(config)
         .post(endpoint)
         .timeout(Duration::from_secs(190))
         .json(&Request {
@@ -94,5 +95,5 @@ pub async fn request(endpoint: Url, id: &str, label: &str) -> Result<Response> {
             role: "desktop",
         })
         .send()
-        .await?)
+        .await
 }

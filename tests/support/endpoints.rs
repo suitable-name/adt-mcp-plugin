@@ -1,17 +1,18 @@
 use std::{fs, io::Write, path::Path};
 
 use anyhow::{Context, Result, ensure};
-use reqwest::{Client, StatusCode};
 use ring::digest::{SHA256, digest};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use trillium_client::{Method, Status};
 
 use super::{
-    DESKTOP, Desktop, Identity, Operator, Server, connect_bridge, http, matching_log, process,
-    read_rpc, send_result, tls,
+    DESKTOP, Desktop, Identity, Operator, ResponseExt, Server, connect_bridge, http, matching_log,
+    process, read_rpc, send_result, tls,
 };
+use crate::https::Client;
 
-pub async fn assign_workspaces(operator: &mut Operator) -> Result<()> {
+pub async fn assign_workspaces(operator: &Operator) -> Result<()> {
     for (label, choose_second) in [("Alice Desktop", false), ("Bob Desktop", true)] {
         operator.keys(b"\x1b[Be")?;
         operator.visible("Allowed Endpoints").await?;
@@ -78,18 +79,17 @@ async fn verify_setup_error(profile: &Path, instruction: &str) -> Result<()> {
         "Missing configuration did not explain how to set up the MCP client."
     );
     drop(desktop.stdin);
-    desktop.child.wait().await?;
+    desktop.child.status().await?;
     Ok(())
 }
 
 async fn catalog(http: &Client, server: &Server) -> Result<Value> {
-    Ok(http
-        .get(format!("https://{}/endpoints", server.data))
+    http.request(Method::Get, format!("https://{}/endpoints", server.data))
         .send()
         .await?
         .error_for_status()?
         .json()
-        .await?)
+        .await
 }
 
 fn revoke_grants(pki: &Path, desktop: &Identity) -> Result<()> {
@@ -134,31 +134,31 @@ async fn check_cross_desktop_access(
 ) -> Result<()> {
     let denied = bob_http
         .post(mcp)
-        .header("x-sap-adt-endpoint", alice_id)
+        .header("x-sap-adt-endpoint", alice_id.to_owned())
         .json(&initialize())
         .send()
         .await?;
-    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(denied.status(), Status::Forbidden);
     let initialized = alice_http
         .post(mcp)
-        .header("x-sap-adt-endpoint", alice_id)
+        .header("x-sap-adt-endpoint", alice_id.to_owned())
         .json(&initialize())
         .send()
         .await?
         .error_for_status()?;
     let session = initialized
-        .headers()
-        .get("mcp-session-id")
-        .context("Missing Alice's session ID.")?;
+        .header("mcp-session-id")
+        .context("Missing Alice's session ID.")?
+        .to_owned();
     let ping = json!({"jsonrpc":"2.0","method":"ping","id":2});
     let stolen = bob_http
         .post(mcp)
-        .header("x-sap-adt-endpoint", bob_id)
+        .header("x-sap-adt-endpoint", bob_id.to_owned())
         .header("mcp-session-id", session)
         .json(&ping)
         .send()
         .await?;
-    assert_eq!(stolen.status(), StatusCode::NOT_FOUND);
+    assert_eq!(stolen.status(), Status::NotFound);
     Ok(())
 }
 
@@ -174,8 +174,8 @@ pub async fn exercise_isolation(
     let alice_id = fingerprint(alice_eclipse)?;
     let bob_id = fingerprint(bob_eclipse)?;
     let bob_desktop = stored_identity(bob_profile)?;
-    let alice_http = http(tls(ca, Some(&stored_identity(alice_profile)?))?)?;
-    let bob_http = http(tls(ca, Some(&bob_desktop))?)?;
+    let alice_http = http(tls(ca, Some(&stored_identity(alice_profile)?))?);
+    let bob_http = http(tls(ca, Some(&bob_desktop))?);
     let mcp = format!("https://{}/mcp", server.data);
     assert_eq!(
         catalog(&alice_http, server).await?,
@@ -188,11 +188,11 @@ pub async fn exercise_isolation(
     select(bob_profile, "Bob Eclipse", true).await?;
     let offline = alice_http
         .post(&mcp)
-        .header("x-sap-adt-endpoint", &alice_id)
+        .header("x-sap-adt-endpoint", alice_id.clone())
         .json(&initialize())
         .send()
         .await?;
-    assert_eq!(offline.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(offline.status(), Status::ServiceUnavailable);
 
     let alice_bridge = connect_bridge(&tls(ca, Some(alice_eclipse))?, server).await?;
     let mut bob_bridge = connect_bridge(&tls(ca, Some(bob_eclipse))?, server).await?;
@@ -242,7 +242,7 @@ pub async fn exercise_isolation(
     );
     assert_eq!(catalog(&bob_http, server).await?, json!({"endpoints":[]}));
     drop(desktop.stdin);
-    desktop.child.wait().await?;
+    desktop.child.status().await?;
     drop(bob_bridge);
     matching_log(&mut server.logs, "Eclipse bridge disconnected.").await?;
     Ok(())

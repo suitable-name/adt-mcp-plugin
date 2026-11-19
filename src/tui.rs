@@ -329,7 +329,7 @@ pub async fn run(
 ) -> Result<()> {
     let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
     let signal = Arc::clone(&stop.0);
-    let mut terminal = tokio::task::spawn_blocking(move || {
+    let mut terminal = smol::unblock(move || {
         let mut ui = Ui {
             enrollment,
             pki,
@@ -348,12 +348,15 @@ pub async fn run(
         };
         interact(&mut ui, &signal)
     });
-    tokio::select! {
-        result = &mut terminal => result?,
-        result = service => {
-            drop(stop);
-            terminal.await??;
-            result
-        }
+    // `true` marks that the service ended first.
+    let (service_ended, result) =
+        smol::future::or(async { (false, (&mut terminal).await) }, async {
+            (true, service.await)
+        })
+        .await;
+    if service_ended {
+        drop(stop);
+        terminal.await?;
     }
+    result
 }

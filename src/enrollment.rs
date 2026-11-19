@@ -7,31 +7,21 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use axum::{
-    Extension, Json, Router,
-    body::{Body, to_bytes},
-    extract::{Request, State},
-    http::{StatusCode, header},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::post,
-};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use smol::{channel, lock::Mutex, net::TcpListener};
 use subtle::ConstantTimeEq;
-use tokio::{
-    net::TcpListener,
-    sync::{Mutex, oneshot},
-    time::timeout,
-};
+use trillium_http::{KnownHeaderName, Method, Status};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    rt::timeout,
     security::{
         Pki, fingerprint,
         token::{self, ALPHABET},
     },
-    transport,
+    transport::{self, Conn, Handoff, Peer, Service, Upgrade},
+    web::{Reply, is_json},
 };
 
 const WINDOW_CAP: usize = 16;
@@ -85,7 +75,7 @@ struct Pending {
     number: u64,
     peer: SocketAddr,
     deadline: Instant,
-    reply: oneshot::Sender<oneshot::Receiver<()>>,
+    reply: channel::Sender<channel::Receiver<()>>,
 }
 
 struct Grant {
@@ -120,24 +110,24 @@ impl Window {
         &mut self,
         applicant: Applicant,
         peer: SocketAddr,
-    ) -> Result<oneshot::Receiver<oneshot::Receiver<()>>, StatusCode> {
+    ) -> Result<channel::Receiver<channel::Receiver<()>>, Status> {
         self.expire();
         if !self.enabled {
-            return Err(StatusCode::FORBIDDEN);
+            return Err(Status::Forbidden);
         }
         if self.pending.contains_key(&applicant.id)
             || self.grants.iter().any(|g| g.applicant.id == applicant.id)
         {
-            return Err(StatusCode::CONFLICT);
+            return Err(Status::Conflict);
         }
         if self.pending.len() + self.grants.len() >= WINDOW_CAP {
-            return Err(StatusCode::TOO_MANY_REQUESTS);
+            return Err(Status::TooManyRequests);
         }
         self.last_number = self
             .last_number
             .checked_add(1)
-            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        let (reply, receiver) = oneshot::channel();
+            .ok_or(Status::ServiceUnavailable)?;
+        let (reply, receiver) = channel::bounded(1);
         let pending = Pending {
             applicant,
             number: self.last_number,
@@ -165,10 +155,10 @@ impl Window {
         let mut token = Zeroizing::new(encode(&secret, pin));
         // Reserve a live waiter before revealing the token. Its HTTP response
         // is released only once the console has accepted the complete line.
-        let (commit, confirmation) = oneshot::channel();
+        let (commit, confirmation) = channel::bounded(1);
         pending
             .reply
-            .send(confirmation)
+            .try_send(confirmation)
             .map_err(|_| anyhow!("The requester disconnected."))?;
         token.push('\n');
         console.write_all(token.as_bytes())?;
@@ -180,7 +170,7 @@ impl Window {
         });
         // Once the operator receives a complete token, it is valid. Loss
         // of the HTTP approval response after that point cannot undo it.
-        let _ = commit.send(());
+        let _ = commit.try_send(());
         Ok(())
     }
 
@@ -289,7 +279,7 @@ impl Enrollment {
 
     // Operator methods run on the terminal thread, outside the async runtime.
     pub(crate) fn snapshot(&self) -> (bool, Vec<ApplicantRow>) {
-        let mut window = self.window.blocking_lock();
+        let mut window = self.window.lock_blocking();
         window.expire();
         let enabled = window.enabled;
         let mut rows: Vec<_> = window
@@ -309,7 +299,7 @@ impl Enrollment {
     }
 
     pub(crate) fn set_open(&self, open: bool) {
-        let mut window = self.window.blocking_lock();
+        let mut window = self.window.lock_blocking();
         if open {
             window.enabled = true;
         } else {
@@ -336,7 +326,7 @@ impl Enrollment {
         applicant: &ApplicantRow,
         output: &mut impl Write,
     ) -> Result<()> {
-        let mut window = self.window.blocking_lock();
+        let mut window = self.window.lock_blocking();
         ensure_selected(&window, applicant)?;
         window.approve(&applicant.id, &self.pki.ca_pin(), output)?;
         drop(window);
@@ -345,7 +335,7 @@ impl Enrollment {
     }
 
     pub(crate) fn deny(&self, applicant: &ApplicantRow) -> Result<()> {
-        let mut window = self.window.blocking_lock();
+        let mut window = self.window.lock_blocking();
         ensure_selected(&window, applicant)?;
         window.pending.remove(&applicant.id);
         drop(window);
@@ -383,97 +373,114 @@ impl Drop for Claim {
     }
 }
 
-async fn read<T: DeserializeOwned>(body: Body) -> Result<T, StatusCode> {
-    let bytes = timeout(Duration::from_secs(5), to_bytes(body, 4096))
-        .await
-        .map_err(|_| StatusCode::REQUEST_TIMEOUT)?
-        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
-    serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)
+async fn read<T: DeserializeOwned>(conn: &mut Conn) -> Result<T, Status> {
+    // trillium refuses a body over 4096 bytes: by its declared length, or
+    // while counting the bytes of a chunked body. Nothing larger is buffered.
+    let bytes = timeout(
+        Duration::from_secs(5),
+        conn.request_body().with_max_len(4096).read_bytes(),
+    )
+    .await
+    .map_err(|_| Status::RequestTimeout)?
+    .map_err(|_| Status::PayloadTooLarge)?;
+    serde_json::from_slice(&bytes).map_err(|_| Status::BadRequest)
 }
 
-async fn request(
-    State(state): State<Enrollment>,
-    Extension(peer): Extension<SocketAddr>,
-    body: Body,
-) -> Result<Response, StatusCode> {
-    let applicant: Applicant = read(body).await?;
+async fn request(state: &Enrollment, peer: SocketAddr, conn: &mut Conn) -> Result<Reply, Status> {
+    let applicant: Applicant = read(conn).await?;
     if !applicant.valid() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(Status::BadRequest);
     }
     let id = applicant.id.clone();
     let requested = state.window.lock().await.request(applicant, peer);
     let reply = match requested {
         Ok(reply) => reply,
         // Registration closed between the guard and this point.
-        Err(StatusCode::FORBIDDEN) => {
+        Err(Status::Forbidden) => {
             state.note_closed_refusal(peer);
-            return Ok((StatusCode::FORBIDDEN, REFUSED_CLOSED).into_response());
+            return Ok(Reply::text(Status::Forbidden, REFUSED_CLOSED));
         }
         Err(status) => return Err(status),
     };
     let decision = timeout(APPROVAL_TTL, async {
-        let confirmation = reply.await?;
-        confirmation.await
+        let confirmation = reply.recv().await?;
+        confirmation.recv().await
     })
     .await
-    .map_err(|_| StatusCode::REQUEST_TIMEOUT)?;
+    .map_err(|_| Status::RequestTimeout)?;
     if decision.is_err() {
         // Denied, or discarded because registration was closed while it waited.
-        return Ok((StatusCode::FORBIDDEN, REFUSED_DENIED).into_response());
+        return Ok(Reply::text(Status::Forbidden, REFUSED_DENIED));
     }
-    Ok(Json(Approval {
-        id: &id,
-        ca_pem: state.pki.ca_pem(),
-    })
-    .into_response())
+    Ok(Reply::json(
+        Status::Ok,
+        &Approval {
+            id: &id,
+            ca_pem: state.pki.ca_pem(),
+        },
+    ))
 }
 
-async fn claim(State(state): State<Enrollment>, body: Body) -> Result<Response, StatusCode> {
-    let claim: Claim = read(body).await?;
+async fn claim(state: &Enrollment, conn: &mut Conn) -> Result<Reply, Status> {
+    let claim: Claim = read(conn).await?;
+    let state = state.clone();
     // A single linearization point for close and claim: close either revokes
     // the grant or observes a certificate already committed to the allowlist.
-    tokio::task::spawn_blocking(move || {
-        let mut window = state.window.blocking_lock();
+    smol::unblock(move || {
+        let mut window = state.window.lock_blocking();
         let applicant = window
             .claim(&claim.token, &state.pki.ca_pin())
-            .ok_or(StatusCode::FORBIDDEN)?;
+            .ok_or(Status::Forbidden)?;
         let bundle = state
             .pki
             .issue(&applicant.role, &applicant.label)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|_| Status::InternalServerError)?;
         drop(window);
-        Ok(Json(bundle).into_response())
+        Ok(Reply::json(Status::Ok, &bundle))
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-async fn guard(State(state): State<Enrollment>, request: Request, next: Next) -> Response {
-    if request.headers().contains_key(header::ORIGIN) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    if !state.window.lock().await.enabled {
-        // The transport layer always attaches the TCP peer before routing.
-        if let Some(peer) = request.extensions().get::<SocketAddr>().copied() {
-            state.note_closed_refusal(peer);
+impl Enrollment {
+    /// Route one request to the enrollment endpoints behind the guard checks.
+    async fn respond(&self, conn: &mut Conn, peer: SocketAddr) -> Reply {
+        let is_request = match conn.path() {
+            "/request" => true,
+            "/claim" => false,
+            _ => return Status::NotFound.into(),
+        };
+        if conn.request_headers().has_header(KnownHeaderName::Origin) {
+            return Status::Forbidden.into();
         }
-        return (StatusCode::FORBIDDEN, REFUSED_CLOSED).into_response();
+        if !self.window.lock().await.enabled {
+            self.note_closed_refusal(peer);
+            return Reply::text(Status::Forbidden, REFUSED_CLOSED);
+        }
+        if !is_json(conn.request_headers()) {
+            return Status::UnsupportedMediaType.into();
+        }
+        let result = if conn.method() != Method::Post {
+            Err(Status::MethodNotAllowed)
+        } else if is_request {
+            request(self, peer, conn).await
+        } else {
+            claim(self, conn).await
+        };
+        result
+            .unwrap_or_else(Reply::from)
+            .with_header(KnownHeaderName::CacheControl, "no-store")
     }
-    let json = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|field| field.to_str().ok())
-        .and_then(|media| media.split(';').next())
-        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"));
-    if !json {
-        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+}
+
+impl Service for Enrollment {
+    type Pending = ();
+
+    async fn handle(&self, mut conn: Conn, peer: &Peer, _handoff: &Handoff<()>) -> Conn {
+        let reply = self.respond(&mut conn, peer.addr).await;
+        reply.into_conn(conn)
     }
-    let mut response = next.run(request).await;
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-store"),
-    );
-    response
+
+    async fn upgrade(&self, _upgrade: Upgrade, _peer: &Peer, _pending: Option<()>) {}
 }
 
 pub async fn run(addr: SocketAddr, state: Enrollment, listen_enabled: bool) -> Result<()> {
@@ -482,13 +489,8 @@ pub async fn run(addr: SocketAddr, state: Enrollment, listen_enabled: bool) -> R
     }
     let tls = state.pki.enroll_tls()?;
     let listener = TcpListener::bind(addr).await?;
-    let router = Router::new()
-        .route("/request", post(request))
-        .route("/claim", post(claim))
-        .route_layer(middleware::from_fn_with_state(state.clone(), guard))
-        .with_state(state);
     tracing::info!("Enrollment listening on {}.", listener.local_addr()?);
-    transport::listen(listener, tls, 32, router).await
+    transport::listen(listener, tls, 32, state).await
 }
 
 #[cfg(test)]
@@ -517,7 +519,7 @@ mod tests {
         let pin = [19; 32];
         assert!(window.request(applicant(), peer).is_err());
         window.enabled = true;
-        let mut reply = window.request(applicant(), peer).unwrap();
+        let reply = window.request(applicant(), peer).unwrap();
         assert!(reply.try_recv().is_err());
         assert!(window.request(applicant(), peer).is_err());
         let grant = approve(&mut window, &applicant().id, &pin);
@@ -535,12 +537,12 @@ mod tests {
         };
         let pin = [5; 32];
         let peer = SocketAddr::from(([127, 0, 0, 1], 1));
-        let mut approved = window.request(applicant(), peer).unwrap();
+        let approved = window.request(applicant(), peer).unwrap();
         let token = approve(&mut window, &applicant().id, &pin);
         approved.try_recv().unwrap().try_recv().unwrap();
         let mut other = applicant();
         other.id = "cd".repeat(16);
-        let mut pending = window.request(other, peer).unwrap();
+        let pending = window.request(other, peer).unwrap();
         window.close();
         assert!(pending.try_recv().is_err());
         window.enabled = true;
@@ -559,7 +561,7 @@ mod tests {
         let _request = window.request(applicant(), peer).unwrap();
         window.pending.get_mut(&id).unwrap().deadline = Instant::now();
         assert!(window.approve(&id, &pin, &mut std::io::sink()).is_err());
-        let mut reply = window.request(applicant(), peer).unwrap();
+        let reply = window.request(applicant(), peer).unwrap();
         let token = approve(&mut window, &id, &pin);
         reply.try_recv().unwrap().try_recv().unwrap();
         window.grants[0].deadline = Instant::now();
@@ -584,7 +586,7 @@ mod tests {
             "A disconnected request wrote token bytes."
         );
 
-        let mut receiver = window.request(applicant(), peer).unwrap();
+        let receiver = window.request(applicant(), peer).unwrap();
         let mut too_short = [0_u8; 4];
         assert!(
             window

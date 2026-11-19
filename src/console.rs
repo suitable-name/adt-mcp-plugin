@@ -187,7 +187,7 @@ pub async fn run(enrollment: Enrollment, service: impl Future<Output = Result<()
     output.flush()?;
     let stop = Stop(Arc::new(AtomicBool::new(false)));
     let signal = Arc::clone(&stop.0);
-    let mut task = tokio::task::spawn_blocking(move || {
+    let mut task = smol::unblock(move || {
         let mut operator = Operator {
             gate: enrollment,
             shown: Vec::new(),
@@ -195,12 +195,14 @@ pub async fn run(enrollment: Enrollment, service: impl Future<Output = Result<()
         };
         operator.interact(&mut input, &signal)
     });
-    tokio::select! {
-        result = &mut task => result?,
-        result = service => {
-            drop(stop);
-            task.await??;
-            result
-        }
+    // `true` marks that the service ended first.
+    let (service_ended, result) = smol::future::or(async { (false, (&mut task).await) }, async {
+        (true, service.await)
+    })
+    .await;
+    if service_ended {
+        drop(stop);
+        task.await?;
     }
+    result
 }

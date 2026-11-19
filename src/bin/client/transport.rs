@@ -3,11 +3,9 @@ use std::{
     io::{BufReader, Cursor, Read},
     path::Path,
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
-use reqwest::{Client, Response, Url};
 use rustls::{
     ClientConfig, RootCertStore,
     crypto::ring,
@@ -15,7 +13,10 @@ use rustls::{
     server::WebPkiClientVerifier,
 };
 use serde::{Deserialize, Serialize};
+use trillium_client::Url;
 use zeroize::{Zeroize, Zeroizing};
+
+use crate::https::Client;
 
 pub const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub const PROFILE_NAME: &str = "credentials.json";
@@ -122,28 +123,9 @@ pub fn https_client(ca: CertificateDer<'static>, identity: Option<&Credentials>)
         }
         None => builder.with_no_client_auth(),
     };
-    http_client(config)
+    Ok(http_client(config))
 }
 
-pub fn http_client(config: ClientConfig) -> Result<Client> {
-    Ok(Client::builder()
-        .use_preconfigured_tls(config)
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(620))
-        .build()?)
-}
-
-pub async fn read_body(mut response: Response, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
-    let mut bytes = Zeroizing::new(Vec::new());
-    while let Some(chunk) = response.chunk().await? {
-        ensure!(
-            chunk.len() <= limit - bytes.len(),
-            "Relay response exceeds the size limit."
-        );
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+pub fn http_client(config: ClientConfig) -> Client {
+    Client::new(config)
 }

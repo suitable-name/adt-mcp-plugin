@@ -1,30 +1,94 @@
 use std::{
     io::{self, Read, Write},
-    sync::{Arc, Mutex},
+    num::NonZero,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use portable_pty::{MasterPty, PtySize};
-use tokio::sync::watch;
+use smol::Timer;
 
 type Keyboard = Arc<Mutex<Box<dyn Write + Send>>>;
 
+struct ScreenState {
+    contents: String,
+    closed: bool,
+}
+
+/// The latest rendered terminal text, shared between the reader thread and the test.
+#[derive(Clone)]
+pub struct Screen {
+    state: Arc<Mutex<ScreenState>>,
+}
+
+impl Screen {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ScreenState {
+                contents: String::new(),
+                closed: false,
+            })),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, ScreenState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn publish(&self, contents: String) {
+        self.lock().contents = contents;
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+    }
+
+    /// The screen text as of now.
+    pub(super) fn current(&self) -> String {
+        self.lock().contents.clone()
+    }
+
+    /// Wait until `ready` accepts the screen text; fails once the terminal output has ended.
+    pub(super) async fn wait_for(
+        &self,
+        mut ready: impl FnMut(&str) -> bool + Send,
+    ) -> Result<String> {
+        loop {
+            {
+                let state = self.lock();
+                if ready(&state.contents) {
+                    return Ok(state.contents.clone());
+                }
+                if state.closed {
+                    bail!("The terminal output ended.");
+                }
+            }
+            Timer::after(Duration::from_millis(25)).await;
+        }
+    }
+}
+
 pub struct Terminal {
-    pub(super) screen: watch::Receiver<String>,
+    pub(super) screen: Screen,
     keyboard: Keyboard,
 }
 
 impl Terminal {
     /// Attach before spawning the child. `ConPTY` can request the cursor position during startup.
     pub(super) fn attach(master: &dyn MasterPty, size: PtySize) -> Result<Self> {
+        let (Some(rows), Some(cols)) = (NonZero::new(size.rows), NonZero::new(size.cols)) else {
+            bail!("The test terminal needs at least one row and one column.");
+        };
         let mut reader = master.try_clone_reader()?;
         let keyboard = Arc::new(Mutex::new(master.take_writer()?));
         let replies = Arc::clone(&keyboard);
-        let (output, screen) = watch::channel(String::new());
+        let screen = Screen::new();
+        let output = screen.clone();
         std::thread::Builder::new()
             .name("test-terminal".into())
             .spawn(move || {
-                let mut terminal = vt100::Parser::new(size.rows, size.cols, 0);
+                let mut terminal = vt100::Parser::new(rows, cols, 0);
                 let mut matched = 0;
                 let mut bytes = [0; 8192];
                 loop {
@@ -38,8 +102,9 @@ impl Terminal {
                         break;
                     }
                     // Drain the pipe through shutdown even if the observer has already exited.
-                    let _ = output.send(terminal.screen().contents());
+                    output.publish(terminal.screen().contents());
                 }
+                output.close();
             })?;
         Ok(Self { screen, keyboard })
     }

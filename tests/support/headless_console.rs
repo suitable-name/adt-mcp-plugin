@@ -2,21 +2,21 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Mutex, PoisonError},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
 use portable_pty::{Child, CommandBuilder, PtyPair, PtySize, native_pty_system};
-use reqwest::StatusCode;
 use serde_json::{Value, json};
-use tokio::{
-    io::AsyncBufReadExt,
-    time::{sleep, timeout},
-};
+use smol::{Timer, io::AsyncBufReadExt};
+use trillium_client::Status;
 
 use super::{
     DESKTOP, SERVER, address, http, input, matching_log, process, terminal::Terminal, tls,
 };
+use crate::{https, rt};
+use rt::timeout;
 
 const ROOT: &str = "SAP_ADT_TEST_CONSOLE_DIRECTORY";
 const ATTACHED: &str = "SAP_ADT_TEST_CONSOLE_ATTACHED";
@@ -71,7 +71,8 @@ fn redirected_server_fixture() -> Result<()> {
 
 struct Console {
     child: Box<dyn Child + Send + Sync>,
-    pty: Option<PtyPair>,
+    // The mutex makes `Console: Sync`, so futures borrowing `&Console` are `Send`.
+    pty: Mutex<Option<PtyPair>>,
     terminal: Terminal,
     root: PathBuf,
 }
@@ -100,13 +101,13 @@ impl Console {
         let child = pty.slave.spawn_command(command)?;
         Ok(Self {
             child,
-            pty: Some(pty),
+            pty: Mutex::new(Some(pty)),
             terminal,
             root: root.to_owned(),
         })
     }
 
-    async fn visible(&mut self, marker: &str) -> Result<()> {
+    async fn visible(&self, marker: &str) -> Result<()> {
         timeout(
             Duration::from_secs(30),
             self.terminal
@@ -118,7 +119,7 @@ impl Console {
         Ok(())
     }
 
-    async fn request_number(&mut self, id: &str, label: &str) -> Result<u64> {
+    async fn request_number(&self, id: &str, label: &str) -> Result<u64> {
         let prefix = format!("Pending {id} role=desktop label=\"{label}\" peer=");
         let number = |screen: &str| {
             screen.lines().find_map(|line| {
@@ -142,7 +143,7 @@ impl Console {
         self.terminal.keys(format!("{command}\r").as_bytes())
     }
 
-    async fn grant(&mut self) -> Result<String> {
+    async fn grant(&self) -> Result<String> {
         fn token_line(screen: &str) -> Option<&str> {
             screen
                 .lines()
@@ -155,9 +156,9 @@ impl Console {
         )
         .await
         .context("The console did not show the approved token.")??;
-        let token = token_line(&screen).map(str::to_owned);
-        drop(screen);
-        token.context("Expected a complete token on the local terminal.")
+        token_line(&screen)
+            .map(str::to_owned)
+            .context("Expected a complete token on the local terminal.")
     }
 
     async fn exit(&mut self) -> Result<bool> {
@@ -165,7 +166,7 @@ impl Console {
             if let Some(status) = self.child.try_wait()? {
                 return Ok(status.success());
             }
-            sleep(Duration::from_millis(30)).await;
+            Timer::after(Duration::from_millis(30)).await;
         }
     }
 }
@@ -188,7 +189,12 @@ impl Drop for Console {
         }
         // ClosePseudoConsole can wait for a terminal reply even during teardown.
         // Keep native ClosePseudoConsole off the test runtime's thread.
-        if let Some(pty) = self.pty.take() {
+        let pty = self
+            .pty
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(pty) = pty {
             std::thread::spawn(move || drop(pty));
         }
     }
@@ -203,7 +209,7 @@ async fn listener_addresses(root: &Path) -> Result<(std::net::SocketAddr, std::n
                 address(&log, "Enrollment listening on")?,
             ));
         }
-        sleep(Duration::from_millis(25)).await;
+        Timer::after(Duration::from_millis(25)).await;
     }
 }
 
@@ -221,22 +227,23 @@ fn check_redirected_output(root: &Path) -> Result<String> {
 /// A denied request gets 403, and a public ID reused by another applicant gets a new
 /// approval number, so a stale number cannot approve it.
 async fn deny_and_reuse_id(
-    console: &mut Console,
-    client: &reqwest::Client,
+    console: &Console,
+    client: &https::Client,
     enrollment: std::net::SocketAddr,
 ) -> Result<()> {
     let id = uuid::Uuid::new_v4().simple().to_string();
+    // A spawned task is cancelled when dropped, so each stays bound until awaited.
     let request = |label: &str| {
         let post = client
             .post(format!("https://{enrollment}/request"))
             .json(&json!({"id": id, "role": "desktop", "label": label}));
-        tokio::spawn(async move { post.send().await })
+        rt::spawn(async move { post.send().await })
     };
     let denied = request("Deny this device");
     let first = console.request_number(&id, "Deny this device").await?;
     console.enter(&format!("deny {first}"))?;
     ensure!(
-        denied.await??.status() == StatusCode::FORBIDDEN,
+        denied.await?.status() == Status::Forbidden,
         "Denied device received approval."
     );
     console.visible("Request denied.").await?;
@@ -253,14 +260,14 @@ async fn deny_and_reuse_id(
         .await?;
     console.enter(&format!("deny {second}"))?;
     ensure!(
-        replacement.await??.status() == StatusCode::FORBIDDEN,
+        replacement.await?.status() == Status::Forbidden,
         "A stale approval authorized another applicant."
     );
     Ok(())
 }
 
 async fn ensure_token_consumed(
-    client: &reqwest::Client,
+    client: &https::Client,
     enrollment: std::net::SocketAddr,
     token: &str,
 ) -> Result<()> {
@@ -270,7 +277,7 @@ async fn ensure_token_consumed(
         .send()
         .await?;
     ensure!(
-        replay.status() == StatusCode::FORBIDDEN,
+        replay.status() == Status::Forbidden,
         "A consumed token was accepted twice."
     );
     Ok(())
@@ -305,8 +312,8 @@ async fn headless_scenario() -> Result<()> {
         .await?;
     let (data, enrollment) = listener_addresses(root).await?;
     let ca = fs::read(pki.join("ca.pem"))?;
-    let client = http(tls(&ca, None)?)?;
-    deny_and_reuse_id(&mut console, &client, enrollment).await?;
+    let client = http(tls(&ca, None)?);
+    deny_and_reuse_id(&console, &client, enrollment).await?;
 
     let profile = root.join("client");
     let mut desktop = process(DESKTOP)
@@ -324,7 +331,7 @@ async fn headless_scenario() -> Result<()> {
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut logs = tokio::io::BufReader::new(
+    let mut logs = smol::io::BufReader::new(
         desktop
             .stderr
             .take()
@@ -337,7 +344,7 @@ async fn headless_scenario() -> Result<()> {
         .context("Missing client request ID.")?;
     let number = console.request_number(id, "Approved desktop").await?;
     ensure!(
-        !console.terminal.screen.borrow().contains("GW1-"),
+        !console.terminal.screen.current().contains("GW1-"),
         "A token appeared before the first valid approval."
     );
     check_redirected_output(root)?;
@@ -353,7 +360,7 @@ async fn headless_scenario() -> Result<()> {
     .await?;
     matching_log(&mut logs, "Client profile saved.").await?;
     ensure!(
-        desktop.wait().await?.success(),
+        desktop.status().await?.success(),
         "The real desktop client failed its pinned claim."
     );
     let saved: Value = serde_json::from_slice(&fs::read(profile.join("credentials.json"))?)?;
@@ -376,9 +383,11 @@ async fn headless_scenario() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn headless_grants_use_only_the_controlling_console() -> Result<()> {
-    timeout(Duration::from_secs(150), headless_scenario())
-        .await
-        .context("Timed out exercising headless enrollment.")?
+#[test]
+fn headless_grants_use_only_the_controlling_console() -> Result<()> {
+    smol::block_on(async {
+        Box::pin(timeout(Duration::from_secs(150), headless_scenario()))
+            .await
+            .context("Timed out exercising headless enrollment.")?
+    })
 }

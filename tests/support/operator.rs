@@ -1,14 +1,16 @@
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Mutex, time::Duration};
 
 use super::terminal::Terminal;
 use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use tokio::time::timeout;
+
+use crate::rt::timeout;
 
 /// Operate the same local terminal as a human. The test has no privileged network endpoint.
 pub struct Operator {
     child: Box<dyn Child + Send + Sync>,
-    _terminal: Box<dyn MasterPty + Send>,
+    // Only kept alive. The mutex makes `Operator: Sync`, so `&Operator` futures are `Send`.
+    _terminal: Mutex<Box<dyn MasterPty + Send>>,
     terminal: Terminal,
 }
 
@@ -37,7 +39,7 @@ impl Operator {
         let child = pair.slave.spawn_command(cmd)?;
         Ok(Self {
             child,
-            _terminal: pair.master,
+            _terminal: Mutex::new(pair.master),
             terminal,
         })
     }
@@ -47,26 +49,25 @@ impl Operator {
     }
 
     async fn wait_for(
-        &mut self,
+        &self,
         phase: &'static str,
-        ready: impl FnMut(&String) -> bool,
+        ready: impl FnMut(&str) -> bool + Send,
     ) -> Result<String> {
-        let screen = timeout(
+        timeout(
             Duration::from_secs(15),
             self.terminal.screen.wait_for(ready),
         )
         .await
         .with_context(|| format!("Operator terminal timed out waiting for {phase:?}."))?
-        .with_context(|| format!("Operator terminal closed while waiting for {phase:?}."))?;
-        Ok(screen.clone())
+        .with_context(|| format!("Operator terminal closed while waiting for {phase:?}."))
     }
 
-    pub async fn visible(&mut self, marker: &'static str) -> Result<String> {
+    pub async fn visible(&self, marker: &'static str) -> Result<String> {
         self.wait_for(marker, |screen| screen.contains(marker))
             .await
     }
 
-    pub async fn approve(&mut self, id: &str) -> Result<String> {
+    pub async fn approve(&self, id: &str) -> Result<String> {
         self.wait_for("the pending enrollment request", |s| s.contains(id))
             .await?;
         self.keys(b"a")?;

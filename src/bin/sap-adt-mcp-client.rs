@@ -4,6 +4,10 @@ mod bootstrap;
 mod endpoints;
 #[path = "client/enroll.rs"]
 mod enroll;
+#[path = "../https.rs"]
+mod https;
+#[path = "../rt.rs"]
+mod rt;
 #[path = "client/stdio.rs"]
 mod stdio;
 #[path = "../security/storage.rs"]
@@ -79,9 +83,8 @@ async fn run() -> Result<()> {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
+fn main() -> ExitCode {
+    match smol::block_on(run()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:#}");
