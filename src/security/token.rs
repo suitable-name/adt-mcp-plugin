@@ -12,7 +12,10 @@ pub fn decode(token: &str) -> Option<Zeroizing<[u8; 64]>> {
     let mut accumulator = 0_u16;
     let mut bits = 0;
     let mut length = 0;
-    for symbol in token[3..].bytes().filter(|b| *b != b'-' && !b.is_ascii_whitespace()) {
+    for symbol in token[3..]
+        .bytes()
+        .filter(|b| *b != b'-' && !b.is_ascii_whitespace())
+    {
         let value = match symbol.to_ascii_uppercase() {
             b'O' => 0,
             b'I' | b'L' => 1,

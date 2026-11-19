@@ -137,7 +137,7 @@ The interactive **Logs** tab keeps up to 512 recent entries in memory. Both head
 
 | Symptom | What to check |
 | --- | --- |
-| Enrollment refuses or cannot connect | Verify interactive mode, port 8788 or its configured replacement, firewall reachability, and **Enrollment · Open**. Start a new request after expiry |
+| Enrollment refuses or cannot connect | Verify interactive mode, port 8788 or its configured replacement, firewall reachability, and **Enrollment · Open**. Registration starts closed in the TUI. Requests that arrive while it is closed never appear in the list; the requester sees "Registration is closed on the relay", the Enrollment tab counts them with the latest peer address, and the log notes them (at most every 10 seconds). Press O, then ask the requester to try again. Start a new request after expiry |
 | Token or CA mismatch | Stop the attempt. Verify the company hostname and request ID independently. Obtain a new approval for the correct device |
 | TLS or authorization failure on the data port | Verify the DNS name, clock, certificate lifetime, correct role, and matching enrolled fingerprint. The gateway must preserve end-to-end TLS |
 | Eclipse already connected | A bridge using the same Eclipse certificate is already connected. Enroll each independent workspace separately |

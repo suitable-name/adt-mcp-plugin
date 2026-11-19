@@ -1,8 +1,16 @@
-use std::{fs, io::{self, BufRead, IsTerminal, Read}, path::Path, time::Duration};
+use std::{
+    fs,
+    io::{self, BufRead, IsTerminal, Read},
+    path::Path,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use reqwest::Response;
-use ring::{digest, rand::{SecureRandom, SystemRandom}};
+use ring::{
+    digest,
+    rand::{SecureRandom, SystemRandom},
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::Zeroizing;
 
@@ -31,15 +39,39 @@ fn operator_token() -> Result<Zeroizing<String>> {
         let mut bytes = Zeroizing::new(Vec::new());
         io::stdin().lock().take(257).read_until(b'\n', &mut bytes)?;
         ensure!(bytes.len() <= 256, "The token exceeds the size limit.");
-        Zeroizing::new(std::str::from_utf8(&bytes)
-            .map_err(|_| anyhow!("Invalid token encoding."))?.trim().to_owned())
+        Zeroizing::new(
+            std::str::from_utf8(&bytes)
+                .map_err(|_| anyhow!("Invalid token encoding."))?
+                .trim()
+                .to_owned(),
+        )
     };
-    ensure!(token.len() <= 256 && !token.is_empty(), "Enter a valid enrollment token.");
+    ensure!(
+        token.len() <= 256 && !token.is_empty(),
+        "Enter a valid enrollment token."
+    );
     Ok(token)
 }
 
+/// Local wording for the relay's refusal codes (see `REFUSED_*` in `src/enrollment.rs`).
+fn refusal(status: reqwest::StatusCode, body: &[u8]) -> String {
+    match (status, body) {
+        (reqwest::StatusCode::FORBIDDEN, b"registration-closed") => {
+            "Registration is closed on the relay. Ask the operator to open registration, then enroll again.".into()
+        }
+        (reqwest::StatusCode::FORBIDDEN, b"request-denied") => {
+            "The operator denied this request, or closed registration while it waited. Enroll again.".into()
+        }
+        _ => format!("Enrollment returned HTTP {status}."),
+    }
+}
+
 async fn reply<T: DeserializeOwned>(response: Response) -> Result<T> {
-    ensure!(response.status().is_success(), "Enrollment returned HTTP {}.", response.status());
+    let status = response.status();
+    if !status.is_success() {
+        let body = read_body(response, 256).await.unwrap_or_default();
+        anyhow::bail!(refusal(status, &body));
+    }
     let data = read_body(response, MAX_CREDENTIAL_BYTES).await?;
     serde_json::from_slice(&data).map_err(|_| anyhow!("Invalid enrollment response."))
 }
@@ -49,42 +81,80 @@ async fn request_profile(server: &str, enrollment: &str, label: &str) -> Result<
     let request = endpoint(enrollment, "/request")?;
     let claim = endpoint(enrollment, "/claim")?;
     let mut random = [0_u8; 16];
-    SystemRandom::new().fill(&mut random).map_err(|_| anyhow!("Could not generate a request ID."))?;
+    SystemRandom::new()
+        .fill(&mut random)
+        .map_err(|_| anyhow!("Could not generate a request ID."))?;
     let id = hex::encode(random);
     eprintln!("Enrollment request ID: {id}");
     eprintln!("Role: desktop. Device label: {label}");
     eprintln!("Compare the full ID, role, and label with the server operator before approval.");
-    let approval: Approval = reply(bootstrap::request(request, &id, label)
-        .await.context("Could not request enrollment.")?).await?;
-    ensure!(approval.id == id, "The operator approved a different request ID.");
+    let approval: Approval = reply(
+        bootstrap::request(request, &id, label)
+            .await
+            .context("Could not request enrollment.")?,
+    )
+    .await?;
+    ensure!(
+        approval.id == id,
+        "The operator approved a different request ID."
+    );
     let ca = certificate(approval.ca_pem.as_bytes())?;
     let pin = digest::digest(&digest::SHA256, ca.as_ref());
     let grant = tokio::task::spawn_blocking(operator_token).await??;
-    let decoded = token::decode(&grant).context("The operator supplied an invalid enrollment token.")?;
-    ensure!(&decoded[32..] == pin.as_ref(), "The enrollment token belongs to a different CA.");
+    let decoded =
+        token::decode(&grant).context("The operator supplied an invalid enrollment token.")?;
+    ensure!(
+        &decoded[32..] == pin.as_ref(),
+        "The enrollment token belongs to a different CA."
+    );
     // A new TLS connection must prove possession of a certificate issued by this authenticated CA.
     let http = https_client(ca.clone(), None)?;
-    let credentials: Credentials = reply(http.post(claim).timeout(Duration::from_secs(30))
-        .json(&Claim { token: grant.trim() }).send().await.context("Could not claim the enrollment.")?).await?;
-    ensure!(certificate(credentials.ca.as_bytes())? == ca, "The claimed CA differs from the bootstrap CA.");
-    let profile = Profile { server: server.to_owned(), credentials };
+    let credentials: Credentials = reply(
+        http.post(claim)
+            .timeout(Duration::from_secs(30))
+            .json(&Claim {
+                token: grant.trim(),
+            })
+            .send()
+            .await
+            .context("Could not claim the enrollment.")?,
+    )
+    .await?;
+    ensure!(
+        certificate(credentials.ca.as_bytes())? == ca,
+        "The claimed CA differs from the bootstrap CA."
+    );
+    let profile = Profile {
+        server: server.to_owned(),
+        credentials,
+    };
     // Validate the issued private key, certificate, and certification path before saving.
     drop(profile.connection()?);
     Ok(profile)
 }
 
 pub async fn run(server: &str, enrollment: &str, label: &str, directory: &Path) -> Result<()> {
-    ensure!((1..=64).contains(&label.len()) && !label.trim().is_empty()
-        && label.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' '),
-        "Enter a printable ASCII client label of up to 64 characters.");
-    storage::new_directory(directory).context("Choose a new client profile directory in a trusted parent.")?;
+    ensure!(
+        (1..=64).contains(&label.len())
+            && !label.trim().is_empty()
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' '),
+        "Enter a printable ASCII client label of up to 64 characters."
+    );
+    storage::new_directory(directory)
+        .context("Choose a new client profile directory in a trusted parent.")?;
     let result = async {
         let profile = request_profile(server, enrollment, label).await?;
         let bytes = Zeroizing::new(serde_json::to_vec(&profile)?);
-        ensure!(bytes.len() <= MAX_CREDENTIAL_BYTES, "The issued profile exceeds the size limit.");
+        ensure!(
+            bytes.len() <= MAX_CREDENTIAL_BYTES,
+            "The issued profile exceeds the size limit."
+        );
         storage::write_new(&directory.join(PROFILE_NAME), &bytes)?;
         Ok(())
-    }.await;
+    }
+    .await;
     if result.is_err() {
         // Only remove the reserved directory if it is still empty.
         let _ = fs::remove_dir(directory);
@@ -93,4 +163,22 @@ pub async fn run(server: &str, enrollment: &str, label: &str, directory: &Path) 
         eprintln!("{}", crate::endpoints::SELECT_HELP);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refusal;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn refusal_codes_get_actionable_messages() {
+        assert!(
+            refusal(StatusCode::FORBIDDEN, b"registration-closed").contains("open registration")
+        );
+        assert!(refusal(StatusCode::FORBIDDEN, b"request-denied").contains("denied"));
+        assert_eq!(
+            refusal(StatusCode::FORBIDDEN, b"other"),
+            "Enrollment returned HTTP 403 Forbidden."
+        );
+    }
 }

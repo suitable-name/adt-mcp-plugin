@@ -122,7 +122,7 @@ public final class RelayEnrollment {
             exchange.cancel(true);
         }
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new Failure("The relay refused " + path + " (HTTP " + response.statusCode() + ").");
+            throw new Failure(refusal(path, response.statusCode(), response.body()));
         }
         byte[] bytes = response.body();
         try {
@@ -132,6 +132,23 @@ public final class RelayEnrollment {
         } finally {
             Arrays.fill(bytes, (byte) 0);
         }
+    }
+
+    /**
+     * Local wording for the relay's refusal codes (REFUSED_* in the relay's src/enrollment.rs).
+     * The relay's body text is only compared, never displayed.
+     */
+    static String refusal(String path, int status, byte[] body) {
+        String code = body == null ? "" : new String(body, StandardCharsets.US_ASCII).strip();
+        if (status == 403 && code.equals("registration-closed")) {
+            return "Registration is closed on the relay. Ask the operator to open registration "
+                    + "(O in the relay's Enrollment tab), then request registration again.";
+        }
+        if (status == 403 && code.equals("request-denied")) {
+            return "The operator denied this request, or closed registration while it waited. "
+                    + "Request registration again.";
+        }
+        return "The relay refused " + path + " (HTTP " + status + ").";
     }
 
     /** The GW1 payload holds a 32-byte secret followed by the SHA-256 digest of the CA DER. */

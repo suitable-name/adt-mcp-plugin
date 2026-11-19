@@ -1,9 +1,9 @@
 #[path = "client/bootstrap.rs"]
 mod bootstrap;
-#[path = "client/enroll.rs"]
-mod enroll;
 #[path = "client/endpoints.rs"]
 mod endpoints;
+#[path = "client/enroll.rs"]
+mod enroll;
 #[path = "client/stdio.rs"]
 mod stdio;
 #[path = "../security/storage.rs"]
@@ -19,8 +19,11 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(version, about = "Connect a local MCP application to the SAP ADT relay.",
-    args_conflicts_with_subcommands = true)]
+#[command(
+    version,
+    about = "Connect a local MCP application to the SAP ADT relay.",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -60,9 +63,12 @@ enum Command {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Enroll { server, enrollment, label, profile }) => {
-            enroll::run(&server, &enrollment, &label, &profile).await
-        }
+        Some(Command::Enroll {
+            server,
+            enrollment,
+            label,
+            profile,
+        }) => enroll::run(&server, &enrollment, &label, &profile).await,
         Some(Command::Connect { profile }) => stdio::run(profile.as_deref()).await,
         Some(Command::Endpoints { profile }) => endpoints::list(&profile).await,
         None => match (cli.set_endpoint, cli.profile) {
@@ -90,7 +96,8 @@ mod tests {
 
     #[test]
     fn endpoint_commands_accept_the_documented_arguments() {
-        let cli = Cli::try_parse_from(["client", "--set-endpoint=example", "--profile", "private"]).unwrap();
+        let cli = Cli::try_parse_from(["client", "--set-endpoint=example", "--profile", "private"])
+            .unwrap();
         assert_eq!(cli.set_endpoint.as_deref(), Some("example"));
         assert!(Cli::try_parse_from(["client", "--set-endpoint=example"]).is_err());
         assert!(Cli::try_parse_from(["client", "--profile", "private"]).is_err());

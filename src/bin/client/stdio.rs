@@ -1,7 +1,10 @@
 use std::{
     io,
     path::Path,
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -17,7 +20,10 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::{endpoints, transport::{Profile, read_body}};
+use crate::{
+    endpoints,
+    transport::{Profile, read_body},
+};
 
 const MAX_REQUEST: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE: usize = 9 * 1024 * 1024;
@@ -45,14 +51,24 @@ impl Remote {
         ))?;
         let (http, url) = profile.connection()
             .context("Cannot use the profile's relay URL or credentials. Check the profile or enroll a new one with sap-adt-mcp-client enroll --help.")?;
-        let selection = endpoints::read_selected(directory).with_context(|| format!(
-            "No valid Eclipse endpoint is selected for profile {}. {}", directory.display(), endpoints::SELECT_HELP
-        ))?;
-        Ok(Self { http, url, endpoint: selection.parse()? })
+        let selection = endpoints::read_selected(directory).with_context(|| {
+            format!(
+                "No valid Eclipse endpoint is selected for profile {}. {}",
+                directory.display(),
+                endpoints::SELECT_HELP
+            )
+        })?;
+        Ok(Self {
+            http,
+            url,
+            endpoint: selection.parse()?,
+        })
     }
 
     fn request(&self, method: reqwest::Method) -> RequestBuilder {
-        self.http.request(method, self.url.clone()).header("x-sap-adt-endpoint", self.endpoint.clone())
+        self.http
+            .request(method, self.url.clone())
+            .header("x-sap-adt-endpoint", self.endpoint.clone())
     }
 }
 
@@ -65,13 +81,19 @@ struct Session {
 
 impl Session {
     fn headers(&self, request: RequestBuilder) -> RequestBuilder {
-        request.header(SESSION_ID, self.id.clone()).header(VERSION, self.version.clone())
+        request
+            .header(SESSION_ID, self.id.clone())
+            .header(VERSION, self.version.clone())
     }
 
     async fn close(&self, target: &Remote) {
-        let request = self.headers(target.request(reqwest::Method::DELETE)).timeout(Duration::from_secs(5));
+        let request = self
+            .headers(target.request(reqwest::Method::DELETE))
+            .timeout(Duration::from_secs(5));
         match request.send().await {
-            Ok(response) if response.status().is_success() || response.status() == StatusCode::NOT_FOUND => {}
+            Ok(response)
+                if response.status().is_success() || response.status() == StatusCode::NOT_FOUND => {
+            }
             _ => eprintln!("Could not close the remote MCP session."),
         }
     }
@@ -97,10 +119,14 @@ struct Reply {
 }
 
 async fn post(
-    remote: &Remote, session: Option<&Session>, bytes: Vec<u8>, id: Option<&Value>,
+    remote: &Remote,
+    session: Option<&Session>,
+    bytes: Vec<u8>,
+    id: Option<&Value>,
     initialize: bool,
 ) -> Result<Reply> {
-    let request = remote.request(reqwest::Method::POST)
+    let request = remote
+        .request(reqwest::Method::POST)
         .header(ACCEPT, "application/json, text/event-stream")
         .header(CONTENT_TYPE, "application/json")
         .body(bytes);
@@ -108,49 +134,94 @@ async fn post(
         Some(active) => active.headers(request),
         None => request,
     };
-    let response = request.send().await.context("Could not reach the relay over mutual TLS.")?;
+    let response = request
+        .send()
+        .await
+        .context("Could not reach the relay over mutual TLS.")?;
     let status = response.status();
-    if let Some(session) = session && status == StatusCode::NOT_FOUND {
+    if let Some(session) = session
+        && status == StatusCode::NOT_FOUND
+    {
         session.expired.store(true, Ordering::Release);
     }
     let Some(id) = id else {
-        ensure!(status == StatusCode::ACCEPTED, "The relay rejected a notification (HTTP {status}).");
-        return Ok(Reply { body: None, new_session: None });
+        ensure!(
+            status == StatusCode::ACCEPTED,
+            "The relay rejected a notification (HTTP {status})."
+        );
+        return Ok(Reply {
+            body: None,
+            new_session: None,
+        });
     };
     let session_id = response.headers().get(SESSION_ID).cloned();
-    ensure!(response.headers().get(CONTENT_TYPE).and_then(|header| header.to_str().ok())
-        .and_then(|header| header.split(';').next())
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json")),
+    ensure!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|header| header.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json")),
         "The relay returned an unexpected content type (HTTP {status})."
     );
     let bytes = read_body(response, MAX_RESPONSE).await?;
-    let message: Value = serde_json::from_slice(&bytes).map_err(|_| anyhow!("Invalid JSON from the relay."))?;
-    ensure!(message["jsonrpc"] == "2.0" && message.get("id") == Some(id)
-        && (message.get("error").is_some() ^ message.get("result").is_some())
-        && message.get("method").is_none(), "Invalid JSON-RPC response from the relay.");
-    ensure!(status.is_success() || message.get("error").is_some(), "The relay returned HTTP {status}.");
+    let message: Value =
+        serde_json::from_slice(&bytes).map_err(|_| anyhow!("Invalid JSON from the relay."))?;
+    ensure!(
+        message["jsonrpc"] == "2.0"
+            && message.get("id") == Some(id)
+            && (message.get("error").is_some() ^ message.get("result").is_some())
+            && message.get("method").is_none(),
+        "Invalid JSON-RPC response from the relay."
+    );
+    ensure!(
+        status.is_success() || message.get("error").is_some(),
+        "The relay returned HTTP {status}."
+    );
     let new_session = if initialize && message.get("result").is_some() {
         let assigned_id = session_id.context("The relay did not issue a session ID.")?;
-        ensure!(!assigned_id.as_bytes().is_empty(), "The relay issued an empty session ID.");
-        let version = message["result"]["protocolVersion"].as_str()
-            .context("The relay did not negotiate a protocol version.")?.parse()?;
-        let session = Session { id: assigned_id, version, expired: Arc::new(AtomicBool::new(false)) };
+        ensure!(
+            !assigned_id.as_bytes().is_empty(),
+            "The relay issued an empty session ID."
+        );
+        let version = message["result"]["protocolVersion"]
+            .as_str()
+            .context("The relay did not negotiate a protocol version.")?
+            .parse()?;
+        let session = Session {
+            id: assigned_id,
+            version,
+            expired: Arc::new(AtomicBool::new(false)),
+        };
         let confirmed = message["result"]["_meta"]["com.sap.adt.mcp/endpoint"].as_str();
         if confirmed.map(str::as_bytes) != Some(remote.endpoint.as_bytes()) {
             session.close(remote).await;
-            let error = rpc_error(id, -32_002,
-                "The relay did not confirm the selected Eclipse endpoint. Check the relay version and the desktop profile.");
-            return Ok(Reply { body: Some(error), new_session: None });
+            let error = rpc_error(
+                id,
+                -32_002,
+                "The relay did not confirm the selected Eclipse endpoint. Check the relay version and the desktop profile.",
+            );
+            return Ok(Reply {
+                body: Some(error),
+                new_session: None,
+            });
         }
         Some(session)
     } else {
         None
     };
-    Ok(Reply { body: Some(message), new_session })
+    Ok(Reply {
+        body: Some(message),
+        new_session,
+    })
 }
 
 async fn exchange(
-    remote: &Remote, session: Option<&Session>, bytes: Vec<u8>, message: &Value, output: &Output,
+    remote: &Remote,
+    session: Option<&Session>,
+    bytes: Vec<u8>,
+    message: &Value,
+    output: &Output,
 ) -> Result<Option<Session>> {
     let id = message.get("id");
     let initialize = message["method"] == "initialize";
@@ -177,7 +248,9 @@ async fn exchange(
 }
 
 async fn messages(
-    connection: Result<&Remote, &str>, session: &mut Option<Session>, jobs: &mut JoinSet<Result<()>>,
+    connection: Result<&Remote, &str>,
+    session: &mut Option<Session>,
+    jobs: &mut JoinSet<Result<()>>,
 ) -> Result<()> {
     let output = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut input = BufReader::new(tokio::io::stdin());
@@ -186,7 +259,10 @@ async fn messages(
             done??;
         }
         let mut bytes = Vec::new();
-        let length = (&mut input).take(MAX_REQUEST as u64 + 2).read_until(b'\n', &mut bytes).await?;
+        let length = (&mut input)
+            .take(MAX_REQUEST as u64 + 2)
+            .read_until(b'\n', &mut bytes)
+            .await?;
         if length == 0 {
             return Ok(());
         }
@@ -196,15 +272,24 @@ async fn messages(
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
-        ensure!(bytes.len() <= MAX_REQUEST, "Standard input exceeded the MCP request size limit.");
+        ensure!(
+            bytes.len() <= MAX_REQUEST,
+            "Standard input exceeded the MCP request size limit."
+        );
         let Ok(message) = serde_json::from_slice::<Value>(&bytes) else {
             write(&output, &rpc_error(&Value::Null, -32700, "Invalid JSON.")).await?;
             continue;
         };
         let id = message.get("id");
-        if message["jsonrpc"] != "2.0" || !message["method"].is_string()
-            || id.is_some_and(|id| !(id.is_string() || id.is_i64() || id.is_u64())) {
-            write(&output, &rpc_error(&Value::Null, -32600, "Invalid JSON-RPC request.")).await?;
+        if message["jsonrpc"] != "2.0"
+            || !message["method"].is_string()
+            || id.is_some_and(|id| !(id.is_string() || id.is_i64() || id.is_u64()))
+        {
+            write(
+                &output,
+                &rpc_error(&Value::Null, -32600, "Invalid JSON-RPC request."),
+            )
+            .await?;
             continue;
         }
         let initialize = message["method"] == "initialize" && id.is_some();
@@ -217,7 +302,10 @@ async fn messages(
                 continue;
             }
         };
-        if session.as_ref().is_some_and(|s| s.expired.load(Ordering::Acquire)) {
+        if session
+            .as_ref()
+            .is_some_and(|s| s.expired.load(Ordering::Acquire))
+        {
             *session = None;
         }
         if initialize && session.is_none() {
@@ -226,16 +314,32 @@ async fn messages(
         }
         let Some(current) = session.as_ref() else {
             if let Some(id) = id {
-                write(&output, &rpc_error(id, -32_000, "Initialize a new relay session first.")).await?;
+                write(
+                    &output,
+                    &rpc_error(id, -32_000, "Initialize a new relay session first."),
+                )
+                .await?;
             }
             continue;
         };
         if initialize {
-            write(&output, &rpc_error(&message["id"], -32600, "The session is already initialized.")).await?;
+            write(
+                &output,
+                &rpc_error(
+                    &message["id"],
+                    -32600,
+                    "The session is already initialized.",
+                ),
+            )
+            .await?;
         } else if id.is_none() {
             let _ = exchange(remote, Some(current), bytes, &message, &output).await?;
         } else if jobs.len() >= MAX_CONCURRENT {
-            write(&output, &rpc_error(&message["id"], -32_000, "Too many concurrent requests.")).await?;
+            write(
+                &output,
+                &rpc_error(&message["id"], -32_000, "Too many concurrent requests."),
+            )
+            .await?;
         } else {
             let (target, active, sink) = (remote.clone(), current.clone(), output.clone());
             jobs.spawn(async move {
@@ -257,14 +361,19 @@ pub async fn run(directory: Option<&Path>) -> Result<()> {
     let mut outcome = messages(connection, &mut session, &mut jobs).await;
     while let Some(done) = jobs.join_next().await {
         if outcome.is_ok() {
-            outcome = done.context("An MCP request failed to complete.").and_then(|result| result);
+            outcome = done
+                .context("An MCP request failed to complete.")
+                .and_then(|result| result);
         }
     }
     if let (Some(session), Ok(target)) = (session, connection) {
         session.close(target).await;
     }
     if let Err(error) = &outcome
-        && error.downcast_ref::<io::Error>().is_some_and(|err| err.kind() == io::ErrorKind::BrokenPipe) {
+        && error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|err| err.kind() == io::ErrorKind::BrokenPipe)
+    {
         return Ok(());
     }
     outcome

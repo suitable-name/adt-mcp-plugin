@@ -1,15 +1,21 @@
-use std::{fs, io::BufReader, path::{Path, PathBuf}, sync::Arc};
 use anyhow::{Context, Result, ensure};
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
-    KeyPair, KeyUsagePurpose, PublicKeyData, SerialNumber,
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, PublicKeyData, SerialNumber,
 };
 use rustls::{
-    RootCertStore, ServerConfig, crypto::ring::default_provider,
+    RootCertStore, ServerConfig,
+    crypto::ring::default_provider,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
     server::{ParsedCertificate, WebPkiClientVerifier},
 };
 use serde::Serialize;
+use std::{
+    fs,
+    io::BufReader,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use time::{Duration, OffsetDateTime};
 use zeroize::Zeroizing;
 
@@ -67,8 +73,13 @@ fn params(name: &str, sans: Vec<String>, days: i64) -> Result<CertificateParams>
     Ok(params)
 }
 
-fn server_pem(dns: &str, key: &KeyPair, issuer: &Issuer<'_, impl rcgen::SigningKey>) -> Result<String> {
-    ServerName::try_from(dns).context("Use a DNS name or IP address for the server certificate.")?;
+fn server_pem(
+    dns: &str,
+    key: &KeyPair,
+    issuer: &Issuer<'_, impl rcgen::SigningKey>,
+) -> Result<String> {
+    ServerName::try_from(dns)
+        .context("Use a DNS name or IP address for the server certificate.")?;
     let mut server = params(dns, vec![dns.into()], 825)?;
     server.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     server.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -77,7 +88,10 @@ fn server_pem(dns: &str, key: &KeyPair, issuer: &Issuer<'_, impl rcgen::SigningK
 
 fn check_key(cert: &CertificateDer<'_>, key: &KeyPair) -> Result<()> {
     let public = ParsedCertificate::try_from(cert)?.subject_public_key_info();
-    ensure!(public.as_ref() == key.subject_public_key_info().as_slice(), "Certificate and private key do not match.");
+    ensure!(
+        public.as_ref() == key.subject_public_key_info().as_slice(),
+        "Certificate and private key do not match."
+    );
     Ok(())
 }
 
@@ -101,12 +115,18 @@ fn initialize_files(dir: &Path, files: &[(&str, &str)]) -> Result<()> {
     if result.is_err() {
         for path in created_files {
             if let Err(error) = fs::remove_file(&path) {
-                eprintln!("Failed to remove incomplete PKI file {}: {error}", path.display());
+                eprintln!(
+                    "Failed to remove incomplete PKI file {}: {error}",
+                    path.display()
+                );
             }
         }
         for path in created_dirs.into_iter().rev() {
             if let Err(error) = fs::remove_dir(&path) {
-                eprintln!("Failed to remove incomplete PKI directory {}: {error}", path.display());
+                eprintln!(
+                    "Failed to remove incomplete PKI directory {}: {error}",
+                    path.display()
+                );
             }
         }
     }
@@ -132,15 +152,20 @@ impl Pki {
         let server_key = KeyPair::generate()?;
         let server_cert = server_pem(dns, &server_key, &issuer)?;
         // Publish the bootstrap certificate only after the other files exist.
-        initialize_files(dir, &[
-            ("ca.key", &Zeroizing::new(ca_key.serialize_pem())),
-            ("server.key", &Zeroizing::new(server_key.serialize_pem())),
-            ("server.pem", &server_cert), ("ca.pem", &ca_cert.pem()),
-        ])
+        initialize_files(
+            dir,
+            &[
+                ("ca.key", &Zeroizing::new(ca_key.serialize_pem())),
+                ("server.key", &Zeroizing::new(server_key.serialize_pem())),
+                ("server.pem", &server_cert),
+                ("ca.pem", &ca_cert.pem()),
+            ],
+        )
     }
 
     pub(crate) fn load(dir: &Path) -> Result<Self> {
-        let ca_pem = fs::read_to_string(dir.join("ca.pem")).context("Cannot read the initialized relay CA.")?;
+        let ca_pem = fs::read_to_string(dir.join("ca.pem"))
+            .context("Cannot read the initialized relay CA.")?;
         let ca = pem_cert(&ca_pem)?;
         let issuer_key = Zeroizing::new(fs::read_to_string(dir.join("ca.key"))?);
         let ca_key = KeyPair::from_pem(&issuer_key)?;
@@ -148,12 +173,21 @@ impl Pki {
         let issuer = Issuer::from_ca_cert_pem(&ca_pem, ca_key)?;
         let server_cert = pem_cert(&fs::read_to_string(dir.join("server.pem"))?)?;
         let mut reader = BufReader::new(fs::File::open(dir.join("server.key"))?);
-        let server_key = rustls_pemfile::private_key(&mut reader)?.context("Missing server private key.")?;
-        check_key(&server_cert, &KeyPair::try_from(&server_key)?).context("Checking server.pem against server.key")?;
+        let server_key =
+            rustls_pemfile::private_key(&mut reader)?.context("Missing server private key.")?;
+        check_key(&server_cert, &KeyPair::try_from(&server_key)?)
+            .context("Checking server.pem against server.key")?;
         for role in ["desktop", "eclipse"] {
             ensure!(dir.join(role).is_dir(), "Missing role directory: {role}.");
         }
-        Ok(Self { dir: dir.to_owned(), issuer, ca, ca_pem, server_cert, server_key })
+        Ok(Self {
+            dir: dir.to_owned(),
+            issuer,
+            ca,
+            ca_pem,
+            server_cert,
+            server_key,
+        })
     }
 
     pub(crate) fn ca_pin(&self) -> [u8; 32] {
@@ -163,7 +197,9 @@ impl Pki {
     pub(crate) fn renew_server(&self, dns: &str) -> Result<()> {
         let pem = server_pem(dns, &KeyPair::try_from(&self.server_key)?, &self.issuer)?;
         let path = self.dir.join("server.pem");
-        storage::stage(&path, pem.as_bytes())?.persist(&path).map_err(|error| error.error)?;
+        storage::stage(&path, pem.as_bytes())?
+            .persist(&path)
+            .map_err(|error| error.error)?;
         Ok(())
     }
 
@@ -179,13 +215,14 @@ impl Pki {
             let mut roots = RootCertStore::empty();
             roots.add(self.ca.clone())?;
             config.with_client_cert_verifier(
-                WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider).build()?
+                WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider).build()?,
             )
         } else {
             config.with_no_client_auth()
         };
         let mut config = config.with_single_cert(
-            vec![self.server_cert.clone(), self.ca.clone()], self.server_key.clone_key()
+            vec![self.server_cert.clone(), self.ca.clone()],
+            self.server_key.clone_key(),
         )?;
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(config)
@@ -224,8 +261,13 @@ impl Pki {
                 let entry = entry?;
                 let name = entry.file_name();
                 if let Some(pin) = name.to_str().filter(|pin| valid_fingerprint(pin))
-                    && let Some(label) = enrolled_label(&entry.path())? {
-                    clients.push(EnrolledClient { role: role.to_owned(), label, fingerprint: pin.to_owned() });
+                    && let Some(label) = enrolled_label(&entry.path())?
+                {
+                    clients.push(EnrolledClient {
+                        role: role.to_owned(),
+                        label,
+                        fingerprint: pin.to_owned(),
+                    });
                 }
             }
         }
@@ -233,21 +275,33 @@ impl Pki {
     }
 
     pub(crate) fn revoke(&self, role: &str, pin: &str) -> Result<()> {
-        ensure!(matches!(role, "desktop" | "eclipse") && valid_fingerprint(pin), "Use a role and its full lowercase SHA-256 fingerprint.");
-        fs::remove_file(self.dir.join(role).join(pin)).context("Cannot remove the enrolled certificate pin.")
+        ensure!(
+            matches!(role, "desktop" | "eclipse") && valid_fingerprint(pin),
+            "Use a role and its full lowercase SHA-256 fingerprint."
+        );
+        fs::remove_file(self.dir.join(role).join(pin))
+            .context("Cannot remove the enrolled certificate pin.")
     }
 
     pub(crate) fn issue(&self, role: &str, label: &str) -> Result<Credentials> {
-        ensure!(matches!(role, "desktop" | "eclipse"), "Unknown certificate role.");
+        ensure!(
+            matches!(role, "desktop" | "eclipse"),
+            "Unknown certificate role."
+        );
         let key = KeyPair::generate()?;
         let mut client = params(&format!("{role}:{label}"), Vec::new(), 365)?;
         client.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         client.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         let cert = client.signed_by(&key, &self.issuer)?;
-        let pin = self.dir.join(role).join(hex::encode(fingerprint(cert.der().as_ref())));
+        let pin = self
+            .dir
+            .join(role)
+            .join(hex::encode(fingerprint(cert.der().as_ref())));
         storage::write_new(&pin, label.as_bytes())?;
         Ok(Credentials {
-            authority: self.ca_pem.clone(), certificate: cert.pem(), private_key: key.serialize_pem(),
+            authority: self.ca_pem.clone(),
+            certificate: cert.pem(),
+            private_key: key.serialize_pem(),
         })
     }
 }
@@ -256,7 +310,11 @@ fn enrolled_label(path: &Path) -> Result<Option<String>> {
     use std::io::{ErrorKind, Read};
 
     let file = match fs::symlink_metadata(path).and_then(|metadata| {
-        if metadata.is_file() { fs::File::open(path).map(Some) } else { Ok(None) }
+        if metadata.is_file() {
+            fs::File::open(path).map(Some)
+        } else {
+            Ok(None)
+        }
     }) {
         Ok(Some(file)) => file,
         Ok(None) => return Ok(None),
@@ -265,14 +323,24 @@ fn enrolled_label(path: &Path) -> Result<Option<String>> {
     };
     let mut bytes = Vec::new();
     file.take(64).read_to_end(&mut bytes)?;
-    let label = bytes.into_iter().map(|byte| {
-        if byte.is_ascii_graphic() || byte == b' ' { char::from(byte) } else { '?' }
-    }).collect();
+    let label = bytes
+        .into_iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                char::from(byte)
+            } else {
+                '?'
+            }
+        })
+        .collect();
     Ok(Some(label))
 }
 
 pub fn valid_fingerprint(pin: &str) -> bool {
-    pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    pin.len() == 64
+        && pin
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 fn has_signed_role(der: &[u8], expected: &str) -> bool {
@@ -280,9 +348,13 @@ fn has_signed_role(der: &[u8], expected: &str) -> bool {
         return false;
     };
     let mut names = cert.subject().iter_common_name();
-    let role = names.next().and_then(|field| field.as_str().ok())
+    let role = names
+        .next()
+        .and_then(|field| field.as_str().ok())
         .and_then(|name| name.split_once(':'));
-    remainder.is_empty() && cert.validity().is_valid() && names.next().is_none()
+    remainder.is_empty()
+        && cert.validity().is_valid()
+        && names.next().is_none()
         && role.is_some_and(|(role, label)| role == expected && !label.is_empty())
 }
 
@@ -305,7 +377,11 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let dir = parent.path().join("pki");
         Pki::init(&dir, "localhost").unwrap();
-        fs::write(dir.join("ca.key"), KeyPair::generate().unwrap().serialize_pem()).unwrap();
+        fs::write(
+            dir.join("ca.key"),
+            KeyPair::generate().unwrap().serialize_pem(),
+        )
+        .unwrap();
         assert!(Pki::load(&dir).is_err());
     }
 
@@ -322,10 +398,17 @@ mod tests {
         let renewed = Pki::load(&dir).unwrap();
         assert_eq!(renewed.ca, pki.ca);
         assert_ne!(renewed.server_cert, pki.server_cert);
-        assert_eq!(fingerprint(renewed.server_key.secret_der()), fingerprint(pki.server_key.secret_der()));
+        assert_eq!(
+            fingerprint(renewed.server_key.secret_der()),
+            fingerprint(pki.server_key.secret_der())
+        );
         assert!(renewed.authorize(&leaf, "desktop"));
         let cert = ParsedCertificate::try_from(&renewed.server_cert).unwrap();
-        rustls::client::verify_server_name(&cert, &ServerName::try_from("replacement.example").unwrap()).unwrap();
+        rustls::client::verify_server_name(
+            &cert,
+            &ServerName::try_from("replacement.example").unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -342,7 +425,11 @@ mod tests {
         assert!(!pki.authorize(&leaf, "eclipse"));
         assert!(!pki.authorize(&leaf, "../desktop"));
         let pin = hex::encode(fingerprint(&leaf));
-        fs::copy(dir.join("desktop").join(&pin), dir.join("eclipse").join(&pin)).unwrap();
+        fs::copy(
+            dir.join("desktop").join(&pin),
+            dir.join("eclipse").join(&pin),
+        )
+        .unwrap();
         assert!(!pki.authorize(&leaf, "eclipse"));
         assert!(pki.revoke("desktop", "../ca.key").is_err());
         pki.revoke("desktop", &pin).unwrap();

@@ -5,7 +5,10 @@ mod rules;
 use std::{
     future::Future,
     io::{self, IsTerminal, Write},
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -21,11 +24,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use zeroize::Zeroizing;
 
 use crate::{
-    enrollment::{ApplicantRow, Enrollment}, logs::Logs, policy::PolicyStore,
+    enrollment::{ApplicantRow, Enrollment},
+    logs::Logs,
+    policy::PolicyStore,
     security::{EnrolledClient, Pki},
 };
-use rules::Editor;
 use endpoints::EndpointEditor;
+use rules::Editor;
 
 const MIN_COLUMNS: u16 = 54;
 const MIN_ROWS: u16 = 18;
@@ -68,6 +73,8 @@ struct Ui {
     selected: usize,
     pending: Vec<ApplicantRow>,
     open: bool,
+    /// Requests refused while registration was closed, and the latest peer.
+    refused: (u64, Option<std::net::SocketAddr>),
     clients: Vec<EnrolledClient>,
     log_offset: usize,
     log_column: usize,
@@ -78,17 +85,21 @@ struct Ui {
 impl Ui {
     fn refresh_pending(&mut self) {
         (self.open, self.pending) = self.enrollment.snapshot();
+        self.refused = self.enrollment.closed_refusals();
     }
 
     fn refresh_clients(&mut self) -> Result<()> {
         self.clients.clear();
         self.clients = self.pki.clients()?;
-        self.clients.sort_by(|a, b| (&a.label, &a.fingerprint).cmp(&(&b.label, &b.fingerprint)));
+        self.clients
+            .sort_by(|a, b| (&a.label, &a.fingerprint).cmp(&(&b.label, &b.fingerprint)));
         Ok(())
     }
 
     fn desktops(&self) -> impl Iterator<Item = &EnrolledClient> {
-        self.clients.iter().filter(|client| client.role == "desktop")
+        self.clients
+            .iter()
+            .filter(|client| client.role == "desktop")
     }
 
     fn count(&self) -> usize {
@@ -126,24 +137,40 @@ impl Ui {
             KeyCode::Tab => self.switch(false)?,
             KeyCode::F(5) if matches!(tab, Tab::Clients | Tab::Rules) => self.refresh_clients()?,
             KeyCode::Up | KeyCode::PageUp if tab == Tab::Logs => {
-                self.log_offset = self.log_offset.saturating_add(if key.code == KeyCode::Up { 1 } else { 10 });
+                self.log_offset =
+                    self.log_offset
+                        .saturating_add(if key.code == KeyCode::Up { 1 } else { 10 });
             }
             KeyCode::Down | KeyCode::PageDown if tab == Tab::Logs => {
-                self.log_offset = self.log_offset.saturating_sub(if key.code == KeyCode::Down { 1 } else { 10 });
+                self.log_offset = self
+                    .log_offset
+                    .saturating_sub(if key.code == KeyCode::Down { 1 } else { 10 });
             }
             KeyCode::End if tab == Tab::Logs => self.log_offset = 0,
             KeyCode::Right if tab == Tab::Logs => self.log_column = (self.log_column + 8).min(2048),
-            KeyCode::Left if tab == Tab::Logs => self.log_column = self.log_column.saturating_sub(8),
+            KeyCode::Left if tab == Tab::Logs => {
+                self.log_column = self.log_column.saturating_sub(8);
+            }
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down => self.selected = (self.selected + 1).min(self.count().saturating_sub(1)),
+            KeyCode::Down => {
+                self.selected = (self.selected + 1).min(self.count().saturating_sub(1));
+            }
             KeyCode::Char('o') if tab == Tab::Enrollment => {
                 self.enrollment.set_open(!self.open);
                 self.refresh_pending();
-                self.status = if self.open { "Enrollment opened." } else { "Enrollment closed. Pending requests and tokens were discarded." }.into();
+                self.status = if self.open {
+                    "Enrollment opened."
+                } else {
+                    "Enrollment closed. Pending requests and tokens were discarded."
+                }
+                .into();
             }
             KeyCode::Char('a' | 'd') if tab == Tab::Enrollment => {
                 if let Some(row) = self.pending.get(self.selected) {
-                    self.dialog = Some(Dialog::Request { row: row.clone(), approve: key.code == KeyCode::Char('a') });
+                    self.dialog = Some(Dialog::Request {
+                        row: row.clone(),
+                        approve: key.code == KeyCode::Char('a'),
+                    });
                     self.status.clear();
                 }
             }
@@ -154,14 +181,26 @@ impl Ui {
                 }
             }
             KeyCode::Enter if tab == Tab::Rules => {
-                let target = self.selected.checked_sub(1).and_then(|index| self.desktops().nth(index)).cloned();
+                let target = self
+                    .selected
+                    .checked_sub(1)
+                    .and_then(|index| self.desktops().nth(index))
+                    .cloned();
                 self.dialog = Some(Dialog::Rules(Editor::open(&self.policy, target)?));
                 self.status.clear();
             }
             KeyCode::Char('e') if tab == Tab::Rules => {
-                let desktop = self.selected.checked_sub(1).and_then(|index| self.desktops().nth(index)).cloned();
+                let desktop = self
+                    .selected
+                    .checked_sub(1)
+                    .and_then(|index| self.desktops().nth(index))
+                    .cloned();
                 if let Some(desktop) = desktop {
-                    self.dialog = Some(Dialog::Endpoints(EndpointEditor::open(&self.policy, &self.pki, desktop)?));
+                    self.dialog = Some(Dialog::Endpoints(EndpointEditor::open(
+                        &self.policy,
+                        &self.pki,
+                        desktop,
+                    )?));
                     self.status.clear();
                 }
             }
@@ -171,17 +210,17 @@ impl Ui {
     }
 
     fn dialog_key(&mut self, key: KeyEvent) -> Result<()> {
-        let Some(dialog) = self.dialog.take() else { return Ok(()); };
+        let Some(dialog) = self.dialog.take() else {
+            return Ok(());
+        };
         match dialog {
-            Dialog::Endpoints(mut editor) => {
-                match editor.key(key, &self.policy, &self.pki) {
-                    Ok(Some(status)) => self.status = status.into(),
-                    other => {
-                        self.dialog = Some(Dialog::Endpoints(editor));
-                        let _ = other?;
-                    }
+            Dialog::Endpoints(mut editor) => match editor.key(key, &self.policy, &self.pki) {
+                Ok(Some(status)) => self.status = status.into(),
+                other => {
+                    self.dialog = Some(Dialog::Endpoints(editor));
+                    let _ = other?;
                 }
-            }
+            },
             Dialog::Rules(mut editor) => {
                 let result = editor.key(key, &self.policy);
                 match result {
@@ -246,8 +285,10 @@ impl Drop for Screen {
 }
 
 fn interact(ui: &mut Ui, stop: &AtomicBool) -> Result<()> {
-    ensure!(io::stdin().is_terminal() && io::stdout().is_terminal(),
-        "The operator interface requires a terminal. Use --headless to serve existing clients.");
+    ensure!(
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+        "The operator interface requires a terminal. Use --headless to serve existing clients."
+    );
     enable_raw_mode()?;
     let _screen = Screen;
     execute!(io::stdout(), EnterAlternateScreen)?;
@@ -256,10 +297,15 @@ fn interact(ui: &mut Ui, stop: &AtomicBool) -> Result<()> {
         ui.refresh_pending();
         ui.selected = ui.selected.min(ui.count().saturating_sub(1));
         let area = terminal.draw(|frame| render::draw(frame, ui))?.area;
-        if event::poll(Duration::from_millis(200))? && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press {
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
             if area.width < MIN_COLUMNS || area.height < MIN_ROWS {
-                if key.code == KeyCode::Char('q') || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+                if key.code == KeyCode::Char('q')
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
                     break;
                 }
                 continue;
@@ -275,14 +321,31 @@ fn interact(ui: &mut Ui, stop: &AtomicBool) -> Result<()> {
 }
 
 pub async fn run(
-    enrollment: Enrollment, pki: Arc<Pki>, policy: Arc<PolicyStore>, logs: Logs,
+    enrollment: Enrollment,
+    pki: Arc<Pki>,
+    policy: Arc<PolicyStore>,
+    logs: Logs,
     service: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
     let signal = Arc::clone(&stop.0);
     let mut terminal = tokio::task::spawn_blocking(move || {
-        let mut ui = Ui { enrollment, pki, policy, logs, tab: 0, selected: 0, pending: Vec::new(),
-            open: false, clients: Vec::new(), log_offset: 0, log_column: 0, dialog: None, status: String::new() };
+        let mut ui = Ui {
+            enrollment,
+            pki,
+            policy,
+            logs,
+            tab: 0,
+            selected: 0,
+            pending: Vec::new(),
+            open: false,
+            refused: (0, None),
+            clients: Vec::new(),
+            log_offset: 0,
+            log_column: 0,
+            dialog: None,
+            status: String::new(),
+        };
         interact(&mut ui, &signal)
     });
     tokio::select! {

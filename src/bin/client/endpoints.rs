@@ -12,7 +12,10 @@ const SELECTION_FILE: &str = "endpoint.json";
 pub const SELECT_HELP: &str = "Run sap-adt-mcp-client endpoints --profile <dir> to list your assigned endpoints, then sap-adt-mcp-client --set-endpoint=<id-or-label> --profile <dir> and restart the MCP connection.";
 
 fn valid_id(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Deserialize, Serialize)]
@@ -42,25 +45,42 @@ struct Listing {
 async fn available(directory: &Path) -> Result<Vec<Endpoint>> {
     let (client, mut url) = Profile::load(directory)?.connection()?;
     url.set_path("/endpoints");
-    let reply = client.get(url).timeout(Duration::from_secs(30)).send().await
-        .context("Could not retrieve assigned endpoints over mutual TLS.")?.error_for_status()?;
+    let reply = client
+        .get(url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .context("Could not retrieve assigned endpoints over mutual TLS.")?
+        .error_for_status()?;
     let bytes = read_body(reply, 4 * 1024 * 1024).await?;
-    let list: Listing = serde_json::from_slice(&bytes).context("Invalid endpoint list from the relay.")?;
-    ensure!(list.endpoints.iter().all(|entry| valid_id(&entry.id) &&
-        entry.label.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' ')),
-        "Invalid endpoint ID or label in the relay response.");
+    let list: Listing =
+        serde_json::from_slice(&bytes).context("Invalid endpoint list from the relay.")?;
+    ensure!(
+        list.endpoints.iter().all(|entry| valid_id(&entry.id)
+            && entry
+                .label
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')),
+        "Invalid endpoint ID or label in the relay response."
+    );
     Ok(list.endpoints)
 }
 
 pub async fn list(directory: &Path) -> Result<()> {
     let endpoints = available(directory).await?;
     if endpoints.is_empty() {
-        println!("No endpoints are assigned to this profile. Ask the relay operator to grant access.");
+        println!(
+            "No endpoints are assigned to this profile. Ask the relay operator to grant access."
+        );
     } else {
         let selected = read_selected(directory).ok();
         println!("Selected\tEndpoint ID\tStatus\tLabel");
         for endpoint in endpoints {
-            let marker = if selected.as_deref() == Some(endpoint.id.as_str()) { "*" } else { "" };
+            let marker = if selected.as_deref() == Some(endpoint.id.as_str()) {
+                "*"
+            } else {
+                ""
+            };
             let status = if endpoint.online { "Online" } else { "Offline" };
             println!("{marker}\t{}\t{status}\t{}", endpoint.id, endpoint.label);
         }
@@ -70,20 +90,30 @@ pub async fn list(directory: &Path) -> Result<()> {
 
 fn resolve<'a>(choice: &str, granted: &'a [Endpoint]) -> Result<&'a str> {
     if choice.len() == 64 && choice.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return granted.iter().find(|entry| entry.id.eq_ignore_ascii_case(choice))
-            .map(|entry| entry.id.as_str()).context("The relay has not assigned this endpoint ID to your profile.");
+        return granted
+            .iter()
+            .find(|entry| entry.id.eq_ignore_ascii_case(choice))
+            .map(|entry| entry.id.as_str())
+            .context("The relay has not assigned this endpoint ID to your profile.");
     }
     let mut matches = granted.iter().filter(|entry| entry.label == choice);
     let entry = matches.next().context("No assigned endpoint has this exact label. Run the endpoints command to see available IDs and labels.")?;
-    ensure!(matches.next().is_none(), "Multiple assigned endpoints have this label. Copy the full endpoint ID from the endpoints command.");
+    ensure!(
+        matches.next().is_none(),
+        "Multiple assigned endpoints have this label. Copy the full endpoint ID from the endpoints command."
+    );
     Ok(&entry.id)
 }
 
 fn save<'a>(directory: &Path, choice: &str, granted: &'a [Endpoint]) -> Result<&'a str> {
     let id = resolve(choice, granted)?;
     let path = directory.join(SELECTION_FILE);
-    let bytes = serde_json::to_vec(&Selection { endpoint: id.to_owned() })?;
-    storage::stage(&path, &bytes)?.persist(&path).context("Could not save the selected endpoint.")?;
+    let bytes = serde_json::to_vec(&Selection {
+        endpoint: id.to_owned(),
+    })?;
+    storage::stage(&path, &bytes)?
+        .persist(&path)
+        .context("Could not save the selected endpoint.")?;
     Ok(id)
 }
 
@@ -103,7 +133,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let id = "a".repeat(64);
         let other = "b".repeat(64);
-        let endpoints = [Endpoint { id: id.clone(), label: String::from("Workspace"), online: false }];
+        let endpoints = [Endpoint {
+            id: id.clone(),
+            label: String::from("Workspace"),
+            online: false,
+        }];
         assert!(read_selected(directory.path()).is_err());
         save(directory.path(), "Workspace", &endpoints).unwrap();
         assert!(save(directory.path(), &other, &endpoints).is_err());
@@ -117,15 +151,35 @@ mod tests {
         let second = "b".repeat(64);
         let third = "c".repeat(64);
         let endpoints = [
-            Endpoint { id: first.clone(), label: String::from("DEV"), online: true },
-            Endpoint { id: second.clone(), label: String::from("DEV"), online: false },
-            Endpoint { id: third, label: first.clone(), online: true },
+            Endpoint {
+                id: first.clone(),
+                label: String::from("DEV"),
+                online: true,
+            },
+            Endpoint {
+                id: second.clone(),
+                label: String::from("DEV"),
+                online: false,
+            },
+            Endpoint {
+                id: third,
+                label: first.clone(),
+                online: true,
+            },
         ];
-        assert!(resolve("DEV", &endpoints).unwrap_err().to_string().contains("full endpoint ID"));
+        assert!(
+            resolve("DEV", &endpoints)
+                .unwrap_err()
+                .to_string()
+                .contains("full endpoint ID")
+        );
         assert!(resolve("dev", &endpoints).is_err());
         assert!(resolve("Missing", &endpoints).is_err());
         assert_eq!(resolve(&first, &endpoints).unwrap(), first);
-        assert_eq!(resolve(&second.to_ascii_uppercase(), &endpoints).unwrap(), second);
+        assert_eq!(
+            resolve(&second.to_ascii_uppercase(), &endpoints).unwrap(),
+            second
+        );
         assert!(resolve(&first, &endpoints[1..]).is_err());
     }
 }

@@ -21,7 +21,10 @@ impl Logs {
         let entries = self.entries();
         *offset = (*offset).min(entries.len().saturating_sub(limit));
         let end = entries.len() - *offset;
-        entries.range(end.saturating_sub(limit)..end).cloned().collect()
+        entries
+            .range(end.saturating_sub(limit)..end)
+            .cloned()
+            .collect()
     }
 }
 
@@ -34,7 +37,10 @@ impl<'a> MakeWriter<'a> for Logs {
     type Writer = Record<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        Record { logs: self, bytes: Vec::new() }
+        Record {
+            logs: self,
+            bytes: Vec::new(),
+        }
     }
 }
 
@@ -54,10 +60,16 @@ impl Drop for Record<'_> {
     fn drop(&mut self) {
         let raw = String::from_utf8_lossy(&self.bytes);
         let lower = raw.to_ascii_lowercase();
-        let entry = if ["gw1-", "private key", "authorization:", "bearer "].iter().any(|&s| lower.contains(s)) {
+        let entry = if ["gw1-", "private key", "authorization:", "bearer "]
+            .iter()
+            .any(|&s| lower.contains(s))
+        {
             "A sensitive log entry was redacted.".into()
         } else {
-            raw.trim_end().chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+            raw.trim_end()
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect()
         };
         let mut entries = self.logs.entries();
         if entries.len() == MAX_ENTRIES {
@@ -85,6 +97,9 @@ mod tests {
         let events = logs.visible(MAX_ENTRIES, &mut 0);
         assert_eq!(events.len(), MAX_ENTRIES);
         assert_eq!(events[0], "Event 1");
-        assert_eq!(events.last().unwrap(), "A sensitive log entry was redacted.");
+        assert_eq!(
+            events.last().unwrap(),
+            "A sensitive log entry was redacted."
+        );
     }
 }

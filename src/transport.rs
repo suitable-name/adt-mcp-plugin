@@ -19,7 +19,10 @@ pub struct PeerCertificate {
 
 impl PeerCertificate {
     fn from_der(der: &[u8]) -> Self {
-        Self { der: Arc::from(der), fingerprint: crate::security::fingerprint(der) }
+        Self {
+            der: Arc::from(der),
+            fingerprint: crate::security::fingerprint(der),
+        }
     }
 }
 
@@ -50,12 +53,18 @@ pub async fn listen(
         let router = router.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let Ok(Ok(stream)) = timeout(Duration::from_secs(10), acceptor.accept(socket)).await else {
+            let Ok(Ok(stream)) = timeout(Duration::from_secs(10), acceptor.accept(socket)).await
+            else {
                 tracing::debug!(%peer, "TLS handshake refused or timed out.");
                 return;
             };
             let mut app = router.layer(Extension::<SocketAddr>(peer));
-            if let Some(leaf) = stream.get_ref().1.peer_certificates().and_then(|chain| chain.first()) {
+            if let Some(leaf) = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+            {
                 app = app.layer(Extension(PeerCertificate::from_der(leaf.as_ref())));
             }
             let result = http1::Builder::new()

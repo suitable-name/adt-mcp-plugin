@@ -3,7 +3,11 @@ use std::{
     io::{self, Write},
     os::windows::io::AsRawHandle,
     ptr,
-    sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::{self, Receiver, TryRecvError}},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -35,7 +39,13 @@ impl Write for Output {
             // SAFETY: the owned output handle and UTF-16 buffer remain valid through this
             // synchronous call. written points to writable DWORD storage.
             let ok = unsafe {
-                WriteConsoleW(self.0.as_raw_handle(), tail.as_ptr(), len, &raw mut written, ptr::null())
+                WriteConsoleW(
+                    self.0.as_raw_handle(),
+                    tail.as_ptr(),
+                    len,
+                    &raw mut written,
+                    ptr::null(),
+                )
             };
             if ok == 0 {
                 return Err(io::Error::last_os_error());
@@ -70,7 +80,13 @@ fn read_console(file: &File) -> io::Result<ReadEvent> {
     // SAFETY: ReadConsoleW receives the number of UTF-16 units available in the buffer,
     // a valid CONIN$ handle, and writable storage for the resulting unit count.
     let ok = unsafe {
-        ReadConsoleW(file.as_raw_handle(), units.as_mut_ptr().cast(), 256, &raw mut count, ptr::null())
+        ReadConsoleW(
+            file.as_raw_handle(),
+            units.as_mut_ptr().cast(),
+            256,
+            &raw mut count,
+            ptr::null(),
+        )
     };
     if ok == 0 {
         return Err(io::Error::last_os_error());
@@ -79,7 +95,12 @@ fn read_console(file: &File) -> io::Result<ReadEvent> {
         return Ok(ReadEvent::End);
     }
     // The operator command language is ASCII; preserve invalid characters as an invalid byte.
-    Ok(ReadEvent::Data(units[..count as usize].iter().map(|&c| u8::try_from(c).unwrap_or(255)).collect()))
+    Ok(ReadEvent::Data(
+        units[..count as usize]
+            .iter()
+            .map(|&c| u8::try_from(c).unwrap_or(255))
+            .collect(),
+    ))
 }
 
 pub(super) struct Input {
@@ -96,21 +117,33 @@ pub(super) fn open() -> io::Result<(Input, Output)> {
     let signal = Arc::clone(&stop);
     // Cooked console input provides native line editing. This reader owns no enrollment
     // state, credentials, or output handle. Screen output never waits for a command.
-    let thread = thread::Builder::new().name("enrollment-input".into()).spawn(move || {
-        while !signal.load(Ordering::Acquire) {
-            let event = read_console(&source);
-            let last = !matches!(event, Ok(ReadEvent::Data(_)));
-            if sender.send(event).is_err() || last {
-                break;
+    let thread = thread::Builder::new()
+        .name("enrollment-input".into())
+        .spawn(move || {
+            while !signal.load(Ordering::Acquire) {
+                let event = read_console(&source);
+                let last = !matches!(event, Ok(ReadEvent::Data(_)));
+                if sender.send(event).is_err() || last {
+                    break;
+                }
             }
-        }
-    })?;
-    Ok((Input { inbox: Some(inbox), thread, stop }, output))
+        })?;
+    Ok((
+        Input {
+            inbox: Some(inbox),
+            thread,
+            stop,
+        },
+        output,
+    ))
 }
 
 impl Input {
     pub(super) fn read_event(&mut self) -> io::Result<ReadEvent> {
-        let inbox = self.inbox.as_mut().ok_or_else(|| io::Error::other("The console reader is closed."))?;
+        let inbox = self
+            .inbox
+            .as_mut()
+            .ok_or_else(|| io::Error::other("The console reader is closed."))?;
         match inbox.try_recv() {
             Ok(event) => event,
             Err(TryRecvError::Empty) => Ok(ReadEvent::Idle),
@@ -130,7 +163,9 @@ impl Drop for Input {
             }
             // SAFETY: JoinHandle retains a valid OS thread handle for this entire loop.
             // ERROR_NOT_FOUND is normal if cancellation races the start/end of the read.
-            unsafe { CancelSynchronousIo(self.thread.as_raw_handle()); }
+            unsafe {
+                CancelSynchronousIo(self.thread.as_raw_handle());
+            }
             thread::sleep(Duration::from_millis(5));
         }
         // Never block process shutdown waiting for an operator to press Enter.
