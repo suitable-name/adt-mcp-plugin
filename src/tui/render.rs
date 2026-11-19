@@ -1,8 +1,10 @@
+use std::time::Instant;
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, List, ListState, Paragraph, Tabs, Wrap},
 };
 
@@ -152,6 +154,10 @@ fn dashboard(frame: &mut Frame<'_>, area: Rect, ui: &mut Ui) -> &'static str {
                 "↑/↓ Select · E Endpoints · Enter Edit Rules · F5 Refresh · Tab Menu · Q Quit"
             }
         }
+        Tab::Connections => {
+            connections(frame, area, ui);
+            "↑/↓ PgUp/PgDn Scroll · Home Top · F5 Refresh Labels · Tab Menu · Q Quit"
+        }
         Tab::Logs => {
             let block = Block::bordered().title("Logs");
             let inner = block.inner(area);
@@ -171,6 +177,93 @@ fn dashboard(frame: &mut Frame<'_>, area: Rect, ui: &mut Ui) -> &'static str {
             "↑/↓ History · PgUp/PgDn Page · ←/→ Pan · End Latest · Tab Menu · Q Quit"
         }
     }
+}
+
+/// A short age such as `42s`, `7m` or `3h 05m`.
+fn age(since: Instant) -> String {
+    let seconds = since.elapsed().as_secs();
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        _ => format!("{}h {:02}m", seconds / 3600, seconds / 60 % 60),
+    }
+}
+
+/// Live Eclipse bridges, each followed by the desktop sessions that use it.
+fn connections(frame: &mut Frame<'_>, area: Rect, ui: &mut Ui) {
+    let sessions: usize = ui.connections.iter().map(|row| row.sessions.len()).sum();
+    let title = format!(
+        "Connections · {} Eclipse · {sessions} desktop session(s)",
+        ui.connections.len()
+    );
+    let block = Block::bordered().title(title);
+    if ui.connections.is_empty() {
+        frame.render_widget(
+            Paragraph::new(
+                "No Eclipse bridge is connected.\n\nDesktop sessions appear here under the Eclipse endpoint they use.",
+            )
+            .block(block)
+            .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    for row in &ui.connections {
+        let label = ui
+            .label("eclipse", &row.endpoint)
+            .unwrap_or("(not enrolled)");
+        let state = match (row.ready, row.busy) {
+            (false, _) => Span::styled("handshake", Style::default().fg(Color::Yellow)),
+            (true, true) => Span::styled("busy", Style::default().fg(Color::Yellow)),
+            (true, false) => Span::styled("ready", Style::default().fg(Color::Green)),
+        };
+        let last = row.last_call.as_ref().map_or_else(
+            || "no calls yet".to_owned(),
+            |(activity, at)| format!("last {activity} {} ago", age(*at)),
+        );
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("Eclipse  {label}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  {}  connected {}  ", row.peer, age(row.since))),
+            state,
+            Span::raw(format!("  {} call(s), {last}", row.calls)),
+        ]));
+        lines.push(Line::styled(format!("    endpoint {}", row.endpoint), dim));
+        if row.sessions.is_empty() {
+            lines.push(Line::styled("    no desktop sessions", dim));
+        }
+        for session in &row.sessions {
+            let desktop = ui
+                .label("desktop", &session.desktop)
+                .unwrap_or("(not enrolled)");
+            let id = session.id.simple().to_string();
+            lines.push(Line::from(format!(
+                "    └ Desktop  {desktop}  {}  session {}  started {} ago  active {} ago  {} request(s), last {}",
+                session.peer,
+                &id[..8],
+                age(session.since),
+                age(session.last_used),
+                session.requests,
+                session.activity,
+            )));
+        }
+        lines.push(Line::raw(""));
+    }
+    let inner = block.inner(area);
+    let max_scroll = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(inner.height);
+    ui.connections_scroll = ui.connections_scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((ui.connections_scroll, 0)),
+        area,
+    );
 }
 
 fn panel(frame: &mut Frame<'_>, area: Rect, title: &str, text: String) {

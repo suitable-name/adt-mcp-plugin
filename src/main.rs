@@ -127,6 +127,8 @@ async fn async_main() -> Result<()> {
             let pki = Arc::new(identity);
             let tls = pki.data_tls()?;
             let relay = Relay::new(Arc::clone(&pki), Arc::clone(&policy));
+            // The operator interface reads live bridges and sessions from the same registry.
+            let registry = relay.registry.clone();
             let enrollment = enrollment::Enrollment::new(Arc::clone(&pki), issue_token);
             let network_enrollment = enrollment.clone();
             let service = async move {
@@ -172,7 +174,7 @@ async fn async_main() -> Result<()> {
                 .await
             };
             match (headless, issue_token) {
-                (false, _) => tui::run(enrollment, pki, policy, logs, service).await,
+                (false, _) => tui::run(enrollment, pki, policy, registry, logs, service).await,
                 (true, true) => console::run(enrollment, service).await,
                 (true, false) => service.await,
             }
@@ -226,7 +228,7 @@ impl Relay {
         }
         timeout(
             Duration::from_secs(615),
-            self.dispatch(conn, route, cert, handoff),
+            self.dispatch(conn, route, cert, peer.addr, handoff),
         )
         .await
         .unwrap_or_else(|_| Status::RequestTimeout.into())
@@ -237,16 +239,18 @@ impl Relay {
         conn: &mut Conn,
         route: Route,
         cert: &PeerCertificate,
+        addr: SocketAddr,
         handoff: &Handoff<Bridge>,
     ) -> Reply {
         match (route, conn.method()) {
             (Route::Endpoints, Method::Get) => mcp::endpoints(self, cert).await,
-            (Route::Mcp, Method::Post) => mcp::request(self, cert, conn).await,
+            (Route::Mcp, Method::Post) => mcp::request(self, cert, conn, addr).await,
             (Route::Mcp, Method::Delete) => {
                 mcp::end_session(self, cert, conn.request_headers()).await
             }
             (Route::Bridge, Method::Get) => {
-                let (reply, bridge) = bridge::upgrade(&self.registry, conn.request_headers(), cert);
+                let (reply, bridge) =
+                    bridge::upgrade(&self.registry, conn.request_headers(), cert, addr);
                 if let Some(bridge) = bridge {
                     handoff.set(bridge);
                 }

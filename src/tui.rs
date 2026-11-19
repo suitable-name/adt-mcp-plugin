@@ -24,6 +24,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use zeroize::Zeroizing;
 
 use crate::{
+    bridge::{BridgeRow, Registry},
     enrollment::{ApplicantRow, Enrollment},
     logs::Logs,
     policy::PolicyStore,
@@ -40,17 +41,25 @@ enum Tab {
     Enrollment,
     Clients,
     Rules,
+    Connections,
     Logs,
 }
 
 impl Tab {
-    const ALL: [Self; 4] = [Self::Enrollment, Self::Clients, Self::Rules, Self::Logs];
+    const ALL: [Self; 5] = [
+        Self::Enrollment,
+        Self::Clients,
+        Self::Rules,
+        Self::Connections,
+        Self::Logs,
+    ];
 
     const fn title(self) -> &'static str {
         match self {
             Self::Enrollment => "Enrollment",
             Self::Clients => "Clients",
             Self::Rules => "Access Rules",
+            Self::Connections => "Connections",
             Self::Logs => "Logs",
         }
     }
@@ -76,6 +85,11 @@ struct Ui {
     /// Requests refused while registration was closed, and the latest peer.
     refused: (u64, Option<std::net::SocketAddr>),
     clients: Vec<EnrolledClient>,
+    registry: Registry,
+    /// Live Eclipse bridges and desktop sessions, refreshed with every frame.
+    connections: Vec<BridgeRow>,
+    /// First line shown on the Connections tab.
+    connections_scroll: u16,
     log_offset: usize,
     log_column: usize,
     dialog: Option<Dialog>,
@@ -86,6 +100,26 @@ impl Ui {
     fn refresh_pending(&mut self) {
         (self.open, self.pending) = self.enrollment.snapshot();
         self.refused = self.enrollment.closed_refusals();
+        self.connections = self.registry.snapshot();
+    }
+
+    /// Scroll the Connections tab; the renderer clamps the offset to its content.
+    fn scroll_connections(&mut self, key: KeyCode) {
+        self.connections_scroll = match key {
+            KeyCode::Up => self.connections_scroll.saturating_sub(1),
+            KeyCode::Down => self.connections_scroll.saturating_add(1),
+            KeyCode::PageUp => self.connections_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.connections_scroll.saturating_add(10),
+            _ => 0,
+        };
+    }
+
+    /// The enrolled label for a certificate fingerprint, if it is still enrolled.
+    fn label(&self, role: &str, fingerprint: &str) -> Option<&str> {
+        self.clients
+            .iter()
+            .find(|client| client.role == role && client.fingerprint == fingerprint)
+            .map(|client| client.label.as_str())
     }
 
     fn refresh_clients(&mut self) -> Result<()> {
@@ -107,7 +141,7 @@ impl Ui {
             Tab::Enrollment => self.pending.len(),
             Tab::Clients => self.clients.len(),
             Tab::Rules => 1 + self.desktops().count(),
-            Tab::Logs => 0,
+            Tab::Connections | Tab::Logs => 0,
         }
     }
 
@@ -116,7 +150,10 @@ impl Ui {
         self.tab = (self.tab + if backwards { count - 1 } else { 1 }) % count;
         self.selected = 0;
         self.status.clear();
-        if matches!(Tab::ALL[self.tab], Tab::Clients | Tab::Rules) {
+        if matches!(
+            Tab::ALL[self.tab],
+            Tab::Clients | Tab::Rules | Tab::Connections
+        ) {
             self.refresh_clients()?;
         }
         Ok(())
@@ -135,7 +172,9 @@ impl Ui {
             KeyCode::Char('q') => return Ok(false),
             KeyCode::BackTab => self.switch(true)?,
             KeyCode::Tab => self.switch(false)?,
-            KeyCode::F(5) if matches!(tab, Tab::Clients | Tab::Rules) => self.refresh_clients()?,
+            KeyCode::F(5) if matches!(tab, Tab::Clients | Tab::Rules | Tab::Connections) => {
+                self.refresh_clients()?;
+            }
             KeyCode::Up | KeyCode::PageUp if tab == Tab::Logs => {
                 self.log_offset =
                     self.log_offset
@@ -150,6 +189,11 @@ impl Ui {
             KeyCode::Right if tab == Tab::Logs => self.log_column = (self.log_column + 8).min(2048),
             KeyCode::Left if tab == Tab::Logs => {
                 self.log_column = self.log_column.saturating_sub(8);
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home
+                if tab == Tab::Connections =>
+            {
+                self.scroll_connections(key.code);
             }
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => {
@@ -324,6 +368,7 @@ pub async fn run(
     enrollment: Enrollment,
     pki: Arc<Pki>,
     policy: Arc<PolicyStore>,
+    registry: Registry,
     logs: Logs,
     service: impl Future<Output = Result<()>>,
 ) -> Result<()> {
@@ -341,6 +386,9 @@ pub async fn run(
             open: false,
             refused: (0, None),
             clients: Vec::new(),
+            registry,
+            connections: Vec::new(),
+            connections_scroll: 0,
             log_offset: 0,
             log_column: 0,
             dialog: None,

@@ -106,6 +106,8 @@ impl Registration {
         let operator = Operator::start(SERVER, pki)?;
         operator.visible("Enrollment").await?;
         operator.keys(b"\t\t\t")?;
+        operator.visible("No Eclipse bridge is connected.").await?;
+        operator.keys(b"\t")?;
         let screen = operator.visible("Enrollment listening on").await?;
         let data = address(&screen, "mutual TLS on")?;
         let enrollment = address(&screen, "Enrollment listening on")?;

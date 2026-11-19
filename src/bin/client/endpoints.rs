@@ -2,7 +2,7 @@ use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use trillium_client::Method;
+use trillium_client::{Method, Status};
 
 use crate::{
     storage,
@@ -47,12 +47,19 @@ async fn available(directory: &Path) -> Result<Vec<Endpoint>> {
     let (client, mut url) = Profile::load(directory)?.connection()?;
     url.set_path("/endpoints");
     let reply = client
-        .request(Method::Get, url)
+        .request(Method::Get, &url)
         .timeout(Duration::from_secs(30))
         .send()
         .await
         .context("Could not retrieve assigned endpoints over mutual TLS.")?;
     let status = reply.status();
+    // The registration listener knows no `/endpoints`; a profile saved with the
+    // enrollment URL as its server is the usual cause of a 404 here.
+    ensure!(
+        status != Status::NotFound,
+        "The relay returned HTTP 404 for the endpoint list. Check that the profile's server URL ({}) is the relay's mutual-TLS port (default 8787, the same as the Eclipse bridge URL), not its registration port (default 8788).",
+        url.origin().ascii_serialization()
+    );
     ensure!(
         status.is_success(),
         "The relay returned HTTP {status} for the endpoint list."

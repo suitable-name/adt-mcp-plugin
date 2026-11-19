@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
@@ -134,6 +135,11 @@ struct Session {
     owner: [u8; 32],
     last_used: Instant,
     version: &'static str,
+    // Monitoring only.
+    created: Instant,
+    peer: SocketAddr,
+    requests: u64,
+    activity: String,
 }
 
 impl Session {
@@ -146,10 +152,20 @@ struct Slot {
     bridge: Client,
     ready: bool,
     sessions: HashMap<Uuid, Session>,
+    // Monitoring only.
+    peer: SocketAddr,
+    since: Instant,
+    calls: u64,
+    last_call: Option<(String, Instant)>,
 }
 
 impl Slot {
-    fn initialize(&mut self, version: &'static str, owner: [u8; 32]) -> Result<Uuid, Status> {
+    fn initialize(
+        &mut self,
+        version: &'static str,
+        owner: [u8; 32],
+        peer: SocketAddr,
+    ) -> Result<Uuid, Status> {
         if !self.ready {
             return Err(Status::ServiceUnavailable);
         }
@@ -159,12 +175,17 @@ impl Slot {
             return Err(Status::TooManyRequests);
         }
         let id = Uuid::new_v4();
+        let now = Instant::now();
         self.sessions.insert(
             id,
             Session {
                 owner,
-                last_used: Instant::now(),
+                last_used: now,
                 version,
+                created: now,
+                peer,
+                requests: 1,
+                activity: "initialize".to_owned(),
             },
         );
         Ok(id)
@@ -191,6 +212,7 @@ impl Registry {
     fn reserve(
         &self,
         endpoint: Arc<str>,
+        peer: SocketAddr,
     ) -> Result<(Reservation, channel::Receiver<Call>), Status> {
         let mut slots = self.slots();
         let full = slots.len() >= MAX_BRIDGES;
@@ -206,6 +228,10 @@ impl Registry {
             bridge,
             ready: false,
             sessions: HashMap::new(),
+            peer,
+            since: Instant::now(),
+            calls: 0,
+            last_call: None,
         });
         drop(slots);
         Ok((
@@ -226,11 +252,63 @@ impl Registry {
         endpoint: &str,
         version: &'static str,
         owner: [u8; 32],
+        peer: SocketAddr,
     ) -> Result<Uuid, Status> {
         self.slots()
             .get_mut(endpoint)
             .ok_or(Status::ServiceUnavailable)?
-            .initialize(version, owner)
+            .initialize(version, owner, peer)
+    }
+
+    /// Record a desktop request on an admitted session, for monitoring.
+    pub(super) fn note_request(&self, client: &Client, id: Uuid, peer: SocketAddr, activity: &str) {
+        if let Some(session) = self
+            .slots()
+            .get_mut(&client.endpoint)
+            .and_then(|slot| slot.sessions.get_mut(&id))
+        {
+            session.peer = peer;
+            session.requests = session.requests.saturating_add(1);
+            activity.clone_into(&mut session.activity);
+        }
+    }
+
+    /// Live bridges and their sessions, for the operator interface.
+    pub(crate) fn snapshot(&self) -> Vec<BridgeRow> {
+        let slots = self.slots();
+        let mut rows: Vec<_> = slots
+            .iter()
+            .map(|(endpoint, slot)| {
+                let mut sessions: Vec<_> = slot
+                    .sessions
+                    .iter()
+                    .filter(|(_, session)| session.last_used.elapsed() < SESSION_IDLE)
+                    .map(|(id, session)| SessionRow {
+                        id: *id,
+                        desktop: hex::encode(session.owner),
+                        peer: session.peer,
+                        since: session.created,
+                        last_used: session.last_used,
+                        requests: session.requests,
+                        activity: session.activity.clone(),
+                    })
+                    .collect();
+                sessions.sort_by_key(|session| session.since);
+                BridgeRow {
+                    endpoint: endpoint.to_string(),
+                    peer: slot.peer,
+                    since: slot.since,
+                    ready: slot.ready,
+                    busy: slot.bridge.admission.available_permits() == 0,
+                    calls: slot.calls,
+                    last_call: slot.last_call.clone(),
+                    sessions,
+                }
+            })
+            .collect();
+        drop(slots);
+        rows.sort_by_key(|row| row.since);
+        rows
     }
 
     pub(super) fn session(
@@ -287,6 +365,47 @@ impl Reservation {
             slot.ready = true;
         }
     }
+
+    /// Count a call forwarded to Eclipse, for monitoring.
+    fn note_call(&self, activity: String) {
+        if let Some(slot) = self.registry.slots().get_mut(&self.endpoint) {
+            slot.calls = slot.calls.saturating_add(1);
+            slot.last_call = Some((activity, Instant::now()));
+        }
+    }
+}
+
+/// A connected (or handshaking) Eclipse bridge, as shown to the operator.
+pub struct BridgeRow {
+    pub endpoint: String,
+    pub peer: SocketAddr,
+    pub since: Instant,
+    pub ready: bool,
+    /// A call is being processed by Eclipse right now.
+    pub busy: bool,
+    pub calls: u64,
+    pub last_call: Option<(String, Instant)>,
+    pub sessions: Vec<SessionRow>,
+}
+
+/// A desktop MCP session bound to a bridge, as shown to the operator.
+pub struct SessionRow {
+    pub id: Uuid,
+    pub desktop: String,
+    /// Address of the desktop's most recent request.
+    pub peer: SocketAddr,
+    pub since: Instant,
+    pub last_used: Instant,
+    pub requests: u64,
+    pub activity: String,
+}
+
+/// What a call does, for monitoring: the tool name for `tools/call`, else the method.
+pub(crate) fn activity(method: &str, params: &Value) -> String {
+    match params["name"].as_str() {
+        Some(tool) if method == "tools/call" => tool.to_owned(),
+        _ => method.to_owned(),
+    }
 }
 
 impl Drop for Reservation {
@@ -308,32 +427,34 @@ pub fn upgrade(
     registry: &Registry,
     headers: &Headers,
     cert: &PeerCertificate,
+    peer: SocketAddr,
 ) -> (Reply, Option<Bridge>) {
     let accept = match handshake(headers) {
         Ok(accept) => accept,
         Err(message) => return (Reply::text(Status::BadRequest, message), None),
     };
-    let (reservation, calls) = match registry.reserve(Arc::from(hex::encode(cert.fingerprint))) {
-        Ok(connection) => connection,
-        Err(Status::Conflict) => {
-            return (
-                Reply::text(
-                    Status::Conflict,
-                    "This Eclipse endpoint is already connected.",
-                ),
-                None,
-            );
-        }
-        Err(status) => {
-            return (
-                Reply::text(
-                    status,
-                    "The relay has reached its Eclipse connection limit.",
-                ),
-                None,
-            );
-        }
-    };
+    let (reservation, calls) =
+        match registry.reserve(Arc::from(hex::encode(cert.fingerprint)), peer) {
+            Ok(connection) => connection,
+            Err(Status::Conflict) => {
+                return (
+                    Reply::text(
+                        Status::Conflict,
+                        "This Eclipse endpoint is already connected.",
+                    ),
+                    None,
+                );
+            }
+            Err(status) => {
+                return (
+                    Reply::text(
+                        status,
+                        "The relay has reached its Eclipse connection limit.",
+                    ),
+                    None,
+                );
+            }
+        };
     let reply = Reply::from(Status::SwitchingProtocols)
         .with_header(KnownHeaderName::Connection, "upgrade")
         .with_header(KnownHeaderName::Upgrade, "websocket")
@@ -450,6 +571,7 @@ async fn serve_connected(
                 if call.reply.is_closed() || call.deadline <= Instant::now() {
                     continue;
                 }
+                reservation.note_call(activity(call.method, &call.params));
                 match exchange(socket, id, call.method, call.params, call.deadline).await {
                     Ok(result) => {
                         let _ = call.reply.try_send(result);
@@ -529,24 +651,65 @@ fn decode_reply(text: &str, id: u64) -> Result<Outcome, ()> {
 mod tests {
     use super::*;
 
+    const PEER: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        4000,
+    ));
+
+    #[test]
+    fn snapshot_reports_bridges_sessions_and_their_activity() {
+        let registry = Registry::default();
+        let (bridge, _calls) = registry.reserve("endpoint".into(), PEER).unwrap();
+        let rows = registry.snapshot();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].ready && rows[0].sessions.is_empty() && rows[0].calls == 0);
+        bridge.mark_ready();
+        let desktop = SocketAddr::from(([10, 0, 0, 7], 5000));
+        let id = registry
+            .initialize("endpoint", "test", [3; 32], desktop)
+            .unwrap();
+        let (client, _) = registry.session(None, id, &[3; 32]).unwrap();
+        registry.note_request(&client, id, desktop, "sap_search_object");
+        bridge.note_call(activity(
+            "tools/call",
+            &json!({"name": "sap_search_object", "arguments": {}}),
+        ));
+        let rows = registry.snapshot();
+        let row = &rows[0];
+        assert!(row.ready && !row.busy);
+        assert_eq!(
+            (row.endpoint.as_str(), row.peer, row.calls),
+            ("endpoint", PEER, 1)
+        );
+        assert_eq!(row.last_call.as_ref().unwrap().0, "sap_search_object");
+        let session = &row.sessions[0];
+        assert_eq!(session.id, id);
+        assert_eq!(session.desktop, hex::encode([3; 32]));
+        assert_eq!(session.peer, desktop);
+        assert_eq!(session.requests, 2);
+        assert_eq!(session.activity, "sap_search_object");
+        drop(bridge);
+        assert!(registry.snapshot().is_empty());
+    }
+
     #[test]
     fn sessions_belong_to_one_desktop_and_one_bridge_connection() {
         let registry = Registry::default();
-        let (first, first_calls) = registry.reserve("first".into()).unwrap();
-        let (other, _other_calls) = registry.reserve("other".into()).unwrap();
+        let (first, first_calls) = registry.reserve("first".into(), PEER).unwrap();
+        let (other, _other_calls) = registry.reserve("other".into(), PEER).unwrap();
         assert!(matches!(
-            registry.reserve("first".into()),
+            registry.reserve("first".into(), PEER),
             Err(Status::Conflict)
         ));
         assert_eq!(
-            registry.initialize("first", "test", [1; 32]),
+            registry.initialize("first", "test", [1; 32], PEER),
             Err(Status::ServiceUnavailable)
         );
         first.mark_ready();
         other.mark_ready();
         assert!(registry.online("first"));
-        let id = registry.initialize("first", "test", [1; 32]).unwrap();
-        let other_id = registry.initialize("other", "test", [1; 32]).unwrap();
+        let id = registry.initialize("first", "test", [1; 32], PEER).unwrap();
+        let other_id = registry.initialize("other", "test", [1; 32], PEER).unwrap();
         assert!(matches!(
             registry.session(None, id, &[2; 32]),
             Err(Status::NotFound)
@@ -568,7 +731,7 @@ mod tests {
         drop(first_calls);
         drop(first);
         assert!(!registry.online("first"));
-        let (second, _second_calls) = registry.reserve("first".into()).unwrap();
+        let (second, _second_calls) = registry.reserve("first".into(), PEER).unwrap();
         second.mark_ready();
         assert!(old_client.sender.is_closed());
         assert_eq!(
@@ -587,20 +750,20 @@ mod tests {
     fn bridge_limit_includes_pending_handshakes_and_releases_on_disconnect() {
         let registry = Registry::default();
         let mut connections: Vec<_> = (0..MAX_BRIDGES)
-            .map(|n| registry.reserve(n.to_string().into()).unwrap())
+            .map(|n| registry.reserve(n.to_string().into(), PEER).unwrap())
             .collect();
         connections[0].0.mark_ready();
-        let id = registry.initialize("0", "test", [1; 32]).unwrap();
+        let id = registry.initialize("0", "test", [1; 32], PEER).unwrap();
         assert!(matches!(
-            registry.reserve("0".into()),
+            registry.reserve("0".into(), PEER),
             Err(Status::Conflict)
         ));
         assert!(matches!(
-            registry.reserve("overflow".into()),
+            registry.reserve("overflow".into(), PEER),
             Err(Status::TooManyRequests)
         ));
         drop(connections.pop());
-        let _replacement = registry.reserve("overflow".into()).unwrap();
+        let _replacement = registry.reserve("overflow".into(), PEER).unwrap();
         assert!(registry.session(Some("0"), id, &[1; 32]).is_ok());
         drop(registry);
     }

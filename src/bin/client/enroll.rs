@@ -11,7 +11,7 @@ use ring::{
     rand::{SecureRandom, SystemRandom},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use trillium_client::Status;
+use trillium_client::{Status, Url};
 use zeroize::Zeroizing;
 
 use super::transport::{
@@ -75,9 +75,18 @@ async fn reply<T: DeserializeOwned>(response: Response) -> Result<T> {
     serde_json::from_slice(&data).map_err(|_| anyhow!("Invalid enrollment response."))
 }
 
+/// The profile's server must be the relay's mutual-TLS listener, not its registration listener.
+fn ensure_distinct_listeners(server: &Url, enrollment: &Url) -> Result<()> {
+    ensure!(
+        server.origin() != enrollment.origin(),
+        "--server and --enrollment name the same address. --server is the relay's mutual-TLS port (default 8787, the same as the Eclipse bridge URL); --enrollment is its registration port (default 8788)."
+    );
+    Ok(())
+}
+
 async fn request_profile(server: &str, enrollment: &str, label: &str) -> Result<Profile> {
-    endpoint(server, "/mcp")?;
     let request = endpoint(enrollment, "/request")?;
+    ensure_distinct_listeners(&endpoint(server, "/mcp")?, &request)?;
     let claim = endpoint(enrollment, "/claim")?;
     let mut random = [0_u8; 16];
     SystemRandom::new()
@@ -166,8 +175,17 @@ pub async fn run(server: &str, enrollment: &str, label: &str, directory: &Path) 
 
 #[cfg(test)]
 mod tests {
-    use super::refusal;
+    use super::{endpoint, ensure_distinct_listeners, refusal};
     use trillium_client::Status;
+
+    #[test]
+    fn the_server_and_enrollment_urls_must_name_different_listeners() {
+        let enrollment = endpoint("https://relay.example.org:8788", "/request").unwrap();
+        let same = endpoint("https://relay.example.org:8788", "/mcp").unwrap();
+        let data = endpoint("https://relay.example.org:8787", "/mcp").unwrap();
+        assert!(ensure_distinct_listeners(&same, &enrollment).is_err());
+        assert!(ensure_distinct_listeners(&data, &enrollment).is_ok());
+    }
 
     #[test]
     fn refusal_codes_get_actionable_messages() {

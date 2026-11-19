@@ -100,6 +100,7 @@ Use Tab and Shift+Tab to switch sections. Arrow keys move the selection. Use low
 | **Enrollment** | `o` opens or closes registration, `a` approves a selected request, `d` denies it. Confirm with Enter |
 | **Clients** | Inspect role, label, and fingerprint. `r` opens revocation for the selected certificate. Enter confirms. F5 refreshes |
 | **Access Rules** | Select a desktop and press `e` for endpoint assignments. Enter opens the action and package editor. F5 refreshes enrolled identities |
+| **Connections** | Live view, refreshed continuously. Each connected Eclipse bridge shows its label, address, connection age, state (handshake, ready, or busy while Eclipse processes a call), the number of forwarded calls, and the last tool. Below it are the desktop MCP sessions using that endpoint, with desktop label, address of the latest request, session ID prefix, age, idle time, request count, and last tool or method. Up/Down and Page Up/Page Down scroll, Home returns to the top, F5 reloads the labels |
 | **Logs** | Up/Down scroll through history, Page Up/Page Down move ten entries, Left/Right pan long lines, End returns to the latest events |
 
 ### Set Access Rules

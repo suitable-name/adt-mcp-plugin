@@ -1,11 +1,11 @@
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 use trillium_http::{Headers, KnownHeaderName, Status};
 use uuid::Uuid;
 
 use crate::Relay;
-use crate::bridge::{Client, Outcome, error};
+use crate::bridge::{Client, Outcome, activity, error};
 use crate::policy::{Effective, PolicyStore};
 use crate::security::{Pki, valid_fingerprint};
 use crate::transport::{Conn, PeerCertificate};
@@ -173,6 +173,7 @@ async fn initialize(
     params: &Value,
     id: &Value,
     cert: &PeerCertificate,
+    peer: SocketAddr,
 ) -> Reply {
     let Some(requested) = params["protocolVersion"].as_str() else {
         return rpc_error(Status::Ok, id, error(-32602, "Missing protocol version."));
@@ -198,7 +199,7 @@ async fn initialize(
     }
     let session = match relay
         .registry
-        .initialize(endpoint, version, cert.fingerprint)
+        .initialize(endpoint, version, cert.fingerprint, peer)
     {
         Ok(session) => session,
         Err(Status::ServiceUnavailable) => {
@@ -249,7 +250,12 @@ fn access_error(status: Status, id: &Value) -> Reply {
     rpc_error(status, id, error(-32_000, &message))
 }
 
-pub async fn request(relay: &Relay, cert: &PeerCertificate, conn: &mut Conn) -> Reply {
+pub async fn request(
+    relay: &Relay,
+    cert: &PeerCertificate,
+    conn: &mut Conn,
+    peer: SocketAddr,
+) -> Reply {
     // The body is read at most up to MAX_BODY bytes: trillium checks the
     // declared length up front and counts chunked bytes as they arrive.
     let Ok(body) = conn
@@ -291,10 +297,16 @@ pub async fn request(relay: &Relay, cert: &PeerCertificate, conn: &mut Conn) -> 
                 error(-32600, "Initialize without a session ID."),
             );
         }
-        return initialize(relay, headers, &params, &message["id"], cert).await;
+        return initialize(relay, headers, &params, &message["id"], cert, peer).await;
     }
     let (client, policy) = match lookup(relay, headers, cert).await {
-        Ok((_, client, policy)) => (client, policy),
+        Ok((session, client, policy)) => {
+            let activity = activity(method, &params);
+            relay
+                .registry
+                .note_request(&client, session, peer, &activity);
+            (client, policy)
+        }
         Err(status) => return access_error(status, &message["id"]),
     };
     let Some(id) = message.get("id") else {
