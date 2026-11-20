@@ -1,5 +1,6 @@
 package com.sap.adt.mcp.preferences;
 
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -7,6 +8,7 @@ import java.util.TreeSet;
 
 import org.eclipse.jface.dialogs.Dialog;
 import org.eclipse.jface.dialogs.IDialogConstants;
+import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
@@ -25,8 +27,9 @@ import com.sap.adt.mcp.tools.ToolCatalog;
 /**
  * The three permission settings for one paired desktop. Whatever is set here applies in addition to the global
  * permissions, so it can only restrict further; leaving a setting at its default means "same as global".
+ * Opened from the SAP ADT Relay view through {@link #edit}.
  */
-final class DesktopPermissionsDialog extends Dialog {
+public final class DesktopPermissionsDialog extends Dialog {
     private static final int SAME_AS_GLOBAL_ID = IDialogConstants.CLIENT_ID + 1;
 
     /** What the user chose. {@code tools == null} means all tools. */
@@ -55,6 +58,45 @@ final class DesktopPermissionsDialog extends Dialog {
         this.desktopLabel = desktopLabel;
         this.shortFingerprint = shortFingerprint;
         this.initial = initial;
+    }
+
+    /**
+     * Opens the dialog for one paired desktop and saves the choice at once.
+     *
+     * @return true if new permissions were saved
+     */
+    public static boolean edit(Shell parent, String keyFingerprint, String label, String shortFingerprint) {
+        if (LocalPolicyStore.locked()) {
+            MessageDialog.openInformation(parent, "Permissions for " + label,
+                    "The permissions are locked by your administrator and cannot be changed here.");
+            return false;
+        }
+        Values start = Values.of(LocalPolicyStore.loadDesktop(keyFingerprint));
+        DesktopPermissionsDialog dialog = new DesktopPermissionsDialog(parent, label, shortFingerprint, start);
+        if (dialog.open() != OK || dialog.result() == null) return false;
+        Values chosen = dialog.result();
+        try {
+            if (chosen.sameAsGlobal()) {
+                LocalPolicyStore.resetDesktop(keyFingerprint);
+            } else {
+                LocalPolicyStore.saveDesktop(keyFingerprint, chosen.readOnly(), chosen.tools(), chosen.patterns());
+            }
+            return true;
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            MessageDialog.openError(parent, "Permissions for " + label, "The permissions could not be saved.");
+            return false;
+        }
+    }
+
+    /** One line for a table: "Same as global", or what this desktop restricts further. */
+    public static String summary(String keyFingerprint) {
+        Values values = Values.of(LocalPolicyStore.loadDesktop(keyFingerprint));
+        if (values.sameAsGlobal()) return "Same as global";
+        List<String> parts = new ArrayList<>();
+        if (values.readOnly()) parts.add("read-only");
+        if (values.tools() != null) parts.add(values.tools().size() + (values.tools().size() == 1 ? " tool" : " tools"));
+        if (!values.patterns().isEmpty()) parts.add(String.join(", ", values.patterns()));
+        return String.join(" · ", parts);
     }
 
     /** The chosen values after OK or "Same as global"; null after Cancel. */

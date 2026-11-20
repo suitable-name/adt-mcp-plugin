@@ -29,19 +29,23 @@
       <initializer class="com.sap.adt.mcp.preferences.PreferenceInitializer"/>
    </extension>
 
-   <!-- Preference pages: MCP Relay, Permissions -->
+   <!-- Preference page: the global settings of this plugin. Per-desktop permissions are set in
+        the SAP ADT Relay view (context menu of a paired desktop). -->
    <extension point="org.eclipse.ui.preferencePages">
       <page
             id="com.sap.adt.mcp.preferences.root"
             name="MCP Relay"
             class="com.sap.adt.mcp.preferences.McpRelayPreferencePage">
+         <keywordReference id="com.sap.adt.mcp.preferences.keywords"/>
       </page>
-      <page
-            id="com.sap.adt.mcp.preferences.permissions"
-            category="com.sap.adt.mcp.preferences.root"
-            name="Permissions"
-            class="com.sap.adt.mcp.preferences.PermissionsPreferencePage">
-      </page>
+   </extension>
+
+   <!-- Words the preference filter matches for this page, besides its name. -->
+   <extension point="org.eclipse.ui.keywords">
+      <keyword
+            id="com.sap.adt.mcp.preferences.keywords"
+            label="mcp relay sap adt permissions read-only tools package patterns encryption encrypted unencrypted desktop">
+      </keyword>
    </extension>
 
 </plugin>

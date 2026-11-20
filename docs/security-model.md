@@ -27,7 +27,7 @@ Tool arguments and results (source code, SQL, object data) travel between the de
 - **Pairing links** (`sap-adt://pair?...`) with confirmation: minted by the plugin, copied on the same machine, claimed through the relay inside a session pinned to the plugin's key. Eclipse asks "Pair <label>?" and shows the desktop key's short fingerprint; no answer within 2 minutes counts as refusal.
 - **Inner TLS 1.3** between client and plugin: ECDSA P-256 keys, one cipher suite, client certificate required, no resumption. Each side trusts only the key it pinned.
 - **Envelope check** in the plugin: method, tool, action class and sequence number are derived from the decrypted request and compared with the relay's envelope.
-- **Local permissions** in Eclipse (**Preferences → MCP Relay → Permissions**): read-only, a tool list and package patterns, globally and per paired desktop. An administrator can preset and lock them.
+- **Local permissions** in Eclipse (globally in **Preferences → MCP Relay**, per paired desktop through the desktop's context menu in the SAP ADT Relay view): read-only, a tool list and package patterns. An administrator can preset and lock them.
 - **`require_e2e`** on the relay (global, and per endpoint): when on, the relay refuses `/mcp` sessions and accepts only tunnel streams. It cannot protect against the relay itself.
 - **The plugin switch** **Allow unencrypted relay calls** (`relay.allowUnencrypted`): when off, this Eclipse refuses legacy clear-text `tools/list` and `tools/call` from the relay.
 - **No downgrade once paired**: when `peers.json` pins the selected endpoint, the client never uses `/mcp`.

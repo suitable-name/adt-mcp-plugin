@@ -29,6 +29,8 @@ import org.eclipse.swt.widgets.Button;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Label;
+import org.eclipse.swt.widgets.Menu;
+import org.eclipse.swt.widgets.MenuItem;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.swt.widgets.Table;
 import org.eclipse.swt.widgets.TableColumn;
@@ -36,10 +38,12 @@ import org.eclipse.swt.widgets.TableItem;
 import org.eclipse.swt.widgets.Text;
 import org.eclipse.ui.PlatformUI;
 import org.eclipse.ui.dialogs.ElementListSelectionDialog;
+import org.eclipse.ui.dialogs.PreferencesUtil;
 import org.eclipse.ui.part.ViewPart;
 
 import com.sap.adt.destinations.ui.logon.AdtLogonServiceUIFactory;
 import com.sap.adt.mcp.Activator;
+import com.sap.adt.mcp.preferences.DesktopPermissionsDialog;
 import com.sap.adt.mcp.preferences.LocalPolicyStore;
 import com.sap.adt.mcp.preferences.PreferenceInitializer;
 import com.sap.adt.mcp.server.PolicyDenials;
@@ -93,6 +97,9 @@ public class McpServerView extends ViewPart {
     private Label pairRemaining;
     private Table pairedTable;
     private Button removePairedButton;
+    private Button desktopPermissionsButton;
+    /** The preference page with the global settings (Preferences → MCP Relay). */
+    private static final String PREFERENCE_PAGE = "com.sap.adt.mcp.preferences.root";
     private final Runnable pinListener = () -> {
         Display display = pairedTable == null || pairedTable.isDisposed() ? null : pairedTable.getDisplay();
         if (display == null || display.isDisposed()) return;
@@ -141,21 +148,77 @@ public class McpServerView extends ViewPart {
         pairLinkText.setLayoutData(linkData);
         showPairing(null);
 
-        Label pairedLabel = new Label(parent, SWT.NONE);
-        pairedLabel.setText("Paired desktops");
+        Label pairedLabel = new Label(parent, SWT.WRAP);
+        pairedLabel.setText("Paired desktops. Right-click a desktop for its permissions; they apply on top of the "
+                + "global settings in Preferences → MCP Relay.");
+        pairedLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
         pairedTable = new Table(parent, SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL);
         pairedTable.setHeaderVisible(true);
         GridData tableData = new GridData(SWT.FILL, SWT.CENTER, true, false);
         tableData.heightHint = 70;
         pairedTable.setLayoutData(tableData);
-        for (String title : new String[] {"Desktop", "Key", "Paired since"}) {
+        String[] titles = {"Desktop", "Key", "Permissions", "Paired since"};
+        int[] widths = {160, 150, 180, 180};
+        for (int i = 0; i < titles.length; i++) {
             TableColumn column = new TableColumn(pairedTable, SWT.NONE);
-            column.setText(title);
-            column.setWidth(title.equals("Paired since") ? 180 : 160);
+            column.setText(titles[i]);
+            column.setWidth(widths[i]);
         }
-        removePairedButton = button(parent, "Remove", this::removePaired);
-        pairedTable.addListener(SWT.Selection, event -> removePairedButton.setEnabled(pairedTable.getSelectionCount() == 1));
+        Composite pairedActions = new Composite(parent, SWT.NONE);
+        pairedActions.setLayout(new RowLayout(SWT.HORIZONTAL));
+        desktopPermissionsButton = button(pairedActions, "Permissions...", this::editDesktopPermissions);
+        removePairedButton = button(pairedActions, "Remove...", this::removePaired);
+        button(pairedActions, "Global Permissions...", this::openGlobalSettings);
+        pairedTable.addListener(SWT.Selection, event -> updatePairedActions());
+        // Double-click (or Enter) opens the permissions of the desktop.
+        pairedTable.addListener(SWT.DefaultSelection, event -> editDesktopPermissions());
+        pairedTable.setMenu(pairedMenu());
         E2eServices.pinStore().addListener(pinListener);
+        refreshPaired();
+    }
+
+    /** The context menu of a paired desktop. */
+    private Menu pairedMenu() {
+        Menu menu = new Menu(pairedTable);
+        MenuItem permissions = new MenuItem(menu, SWT.PUSH);
+        permissions.setText("Permissions...");
+        permissions.addListener(SWT.Selection, event -> editDesktopPermissions());
+        menu.setDefaultItem(permissions);
+        MenuItem remove = new MenuItem(menu, SWT.PUSH);
+        remove.setText("Remove...");
+        remove.addListener(SWT.Selection, event -> removePaired());
+        new MenuItem(menu, SWT.SEPARATOR);
+        MenuItem global = new MenuItem(menu, SWT.PUSH);
+        global.setText("Global Permissions...");
+        global.addListener(SWT.Selection, event -> openGlobalSettings());
+        menu.addListener(SWT.Show, event -> {
+            boolean one = pairedTable.getSelectionCount() == 1;
+            permissions.setEnabled(one);
+            remove.setEnabled(one);
+        });
+        return menu;
+    }
+
+    private void updatePairedActions() {
+        boolean one = pairedTable.getSelectionCount() == 1;
+        removePairedButton.setEnabled(one);
+        desktopPermissionsButton.setEnabled(one);
+    }
+
+    private void editDesktopPermissions() {
+        if (pairedTable.getSelectionCount() != 1) return;
+        TableItem item = pairedTable.getSelection()[0];
+        String fingerprint = (String) item.getData();
+        if (DesktopPermissionsDialog.edit(getSite().getShell(), fingerprint, item.getText(0), item.getText(1))) {
+            item.setText(2, DesktopPermissionsDialog.summary(fingerprint));
+            appendOutput("Saved the permissions of " + item.getText(0) + ". They apply to its next call.\n");
+        }
+    }
+
+    private void openGlobalSettings() {
+        PreferencesUtil.createPreferenceDialogOn(getSite().getShell(), PREFERENCE_PAGE,
+                new String[] {PREFERENCE_PAGE}, null).open();
+        refreshPolicyLine();
         refreshPaired();
     }
 
@@ -167,9 +230,10 @@ public class McpServerView extends ViewPart {
             item.setData(pin.keyFingerprint());
             item.setText(0, pin.label());
             item.setText(1, Pairing.shortFingerprint(pin.keyFingerprint()));
-            item.setText(2, String.valueOf(pin.pairedAt()));
+            item.setText(2, DesktopPermissionsDialog.summary(pin.keyFingerprint()));
+            item.setText(3, String.valueOf(pin.pairedAt()));
         }
-        removePairedButton.setEnabled(false);
+        updatePairedActions();
     }
 
     private void removePaired() {

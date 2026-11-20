@@ -70,7 +70,7 @@ The plugin stores its enrolled identity in the workspace's encrypted `relay-prof
 
 #### Local Permissions
 
-**Window → Preferences → MCP Relay → Permissions** limits what any relay may do in this Eclipse, in addition to the relay's own rules. The stricter of the two always wins, and the local settings can only restrict. The next relay call uses a saved change, without reconnecting.
+**Window → Preferences → MCP Relay** limits what any relay may do in this Eclipse, in addition to the relay's own rules. The stricter of the two always wins, and the local settings can only restrict. The next relay call uses a saved change, without reconnecting.
 
 | Setting | Meaning |
 | --- | --- |
@@ -99,7 +99,7 @@ The desktop connects through the relay, checks this Eclipse's key against the li
 
 The **Paired desktops** list shows each pinned desktop (label, short key fingerprint, paired since). **Remove** unpairs it; it must pair again before it can use this Eclipse.
 
-**Per-desktop permissions.** On **Preferences → MCP Relay → Permissions**, the **Paired desktops** table has one row per paired desktop. **Edit desktop permissions...** sets the same three settings for that desktop (read-only, tools, package patterns). Each setting defaults to "same as global". A call from an encrypted stream is checked against the global permissions and that desktop's settings together, so the desktop can only be restricted further. The administrator keys are `permissions.desktop.<key fingerprint>.readOnly`, `.allowedTools` and `.packagePatterns` (the 64-hex-character fingerprint of the desktop's inner key), and `permissions.locked=true` covers them too. Unencrypted relay calls use the global permissions only.
+**Per-desktop permissions.** In the **SAP ADT Relay** view, the **Paired desktops** table has one row per paired desktop, and its **Permissions** column shows "Same as global" or what that desktop is restricted to. Right-click a desktop and choose **Permissions...** (or double-click it, or select it and click **Permissions...**) to set the same three settings for that desktop (read-only, tools, package patterns); the change is saved when you click **OK**. **Global Permissions...** opens **Preferences → MCP Relay**. Each setting defaults to "same as global". A call from an encrypted stream is checked against the global permissions and that desktop's settings together, so the desktop can only be restricted further. The administrator keys are `permissions.desktop.<key fingerprint>.readOnly`, `.allowedTools` and `.packagePatterns` (the 64-hex-character fingerprint of the desktop's inner key), and `permissions.locked=true` covers them too. Unencrypted relay calls use the global permissions only.
 
 ### Desktop MCP Host
 

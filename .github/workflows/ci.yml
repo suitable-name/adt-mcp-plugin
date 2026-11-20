@@ -86,14 +86,8 @@ jobs:
           MAVEN_VERSION: '3.10.0'
           # SHA-512 published by Apache for the binary tarball.
           MAVEN_SHA512: 908b1501bfb420bf7c8affb855534a9c407fd6099367bfb9f2f2dcb8e9799102bffb84518cde74c679bd76870247c6528683abdd620581bffa90f95d92d175aa
-        run: |
-          archive="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
-          cd "$RUNNER_TEMP"
-          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
-            "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/$MAVEN_VERSION/$archive"
-          printf '%s  %s\n' "$MAVEN_SHA512" "$archive" | sha512sum --check
-          tar -xzf "$archive"
-          echo "$RUNNER_TEMP/apache-maven-$MAVEN_VERSION/bin" >> "$GITHUB_PATH"
+        # Retries every error and falls back to the Apache archive; see the script.
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/install-maven.sh" "$MAVEN_VERSION" "$MAVEN_SHA512"
 
       - name: Build Plugin (Tycho)
         working-directory: java-plugin/sap-adt-mcp-server
