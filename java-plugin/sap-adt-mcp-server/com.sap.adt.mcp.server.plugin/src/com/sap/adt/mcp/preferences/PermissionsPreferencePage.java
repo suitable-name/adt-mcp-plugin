@@ -23,7 +23,7 @@ import org.eclipse.ui.IWorkbench;
 import org.eclipse.ui.IWorkbenchPreferencePage;
 
 import com.sap.adt.mcp.server.LocalPolicy;
-import com.sap.adt.mcp.server.e2e.E2eServices;
+import com.sap.adt.mcp.server.E2eServices;
 import com.sap.adt.mcp.server.e2e.Pairing;
 import com.sap.adt.mcp.server.e2e.PinStore;
 import com.sap.adt.mcp.tools.ToolCatalog;

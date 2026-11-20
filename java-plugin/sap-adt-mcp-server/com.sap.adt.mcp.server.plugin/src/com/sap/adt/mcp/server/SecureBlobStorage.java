@@ -11,18 +11,16 @@ import org.eclipse.equinox.security.storage.SecurePreferencesFactory;
 import org.eclipse.equinox.security.storage.StorageException;
 
 import com.sap.adt.mcp.Activator;
-import com.sap.adt.mcp.server.e2e.KeyStorage;
-import com.sap.adt.mcp.server.e2e.PinStorage;
-
 /**
  * One named blob in Eclipse secure storage, scoped to this workspace, as {@link RelayProfileStore} scopes the relay
- * identity. Backs the inner identity key and the pin list.
+ * identity. Backs the inner identity key and the pin list. The activator installs it with
+ * {@link E2eServices#useStorage}; {@link E2eServices} itself has no Eclipse types.
  */
-final class SecureBlobStorage implements KeyStorage, PinStorage {
+public final class SecureBlobStorage implements E2eServices.Storage {
     private static final int MAX_BYTES = 1024 * 1024;
     private final String name;
 
-    SecureBlobStorage(String name) {
+    public SecureBlobStorage(String name) {
         this.name = name;
     }
 

@@ -32,7 +32,7 @@ use crate::{
     policy::Effective,
     security::valid_fingerprint,
     transport::{PeerCertificate, Upgrade},
-    tunnel_proto::{Class, Control, Envelope, MAX_DATA_PAYLOAD, RelayPolicy, decode_data},
+    tunnel_proto::{Class, Control, Envelope, MAX_DATA_PAYLOAD, RelayPolicy, close, decode_data},
     web::Reply,
 };
 use admission::DENIED;
@@ -348,7 +348,7 @@ impl Session<'_> {
                 return;
             }
             Err(_) => {
-                self.refuse(client_id, "The access policy is unavailable.");
+                self.refuse(client_id, close::POLICY_UNAVAILABLE);
                 return;
             }
         };
@@ -384,7 +384,7 @@ impl Session<'_> {
         };
         if !hub.send(&frame).await {
             hub.remove(bridge_id);
-            self.refuse(client_id, "The Eclipse bridge disconnected.");
+            self.refuse(client_id, close::BRIDGE_GONE);
             return;
         }
         tracing::info!(
@@ -408,7 +408,7 @@ impl Session<'_> {
                 return;
             }
             Err(_) => {
-                self.deny(client_id, envelope.seq, "The access policy is unavailable.");
+                self.deny(client_id, envelope.seq, close::POLICY_UNAVAILABLE);
                 return;
             }
         };
@@ -459,8 +459,7 @@ impl Session<'_> {
                     len,
                 };
                 if !hub.send(&frame).await {
-                    self.end_stream(&hub, bridge_id, "The Eclipse bridge disconnected.")
-                        .await;
+                    self.end_stream(&hub, bridge_id, close::BRIDGE_GONE).await;
                 }
             }
             Forward::Close(reason) => {
@@ -485,8 +484,7 @@ impl Session<'_> {
             return;
         }
         if !hub.send_data(bridge_id, payload).await {
-            self.end_stream(&hub, bridge_id, "The Eclipse bridge disconnected.")
-                .await;
+            self.end_stream(&hub, bridge_id, close::BRIDGE_GONE).await;
         }
     }
 

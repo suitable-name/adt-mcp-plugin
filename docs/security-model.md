@@ -43,6 +43,8 @@ In the current version the switch is **on** by default, so a freshly installed E
 
 When the switch is off, the plugin answers legacy `tools/list` and `tools/call` with error `-32002` and the text "This Eclipse accepts only end-to-end encrypted calls. Pair this desktop with Pair Desktop in the MCP view." `relay/hello` and `ping` still work, so the relay keeps the bridge connection. Encrypted streams are not affected. The MCP view shows "Unencrypted relay calls: allowed" or "blocked" and logs each refusal with the layer "this Eclipse's encryption setting". The setting is read on every call; no restart is needed.
 
+The compromised-relay claims above (no payload in the relay's logs, a forged envelope or wrong `seq` closes the stream, clear-text calls refused with the switch off) are exercised against the real Java plugin bridge, the real relay and a rogue relay by the opt-in test described under "Real plugin end-to-end" in [verification.md](verification.md) (`SAP_ADT_INTEROP=1`, `cargo test --test e2e_relay`).
+
 ## What the relay still sees
 
 - The identity (certificate fingerprint and label) of each desktop and Eclipse, peer addresses, and connection times.
@@ -51,6 +53,8 @@ When the switch is off, the plugin answers legacy `tools/list` and `tools/call` 
 - Its own measured response time.
 
 Object names, package names, source, SQL text, arguments and results are not in the envelope and are not visible to the relay on an encrypted stream. On the legacy path and for unpaired desktops the relay sees everything, as before.
+
+The relay can still word its own refusals, so on an encrypted stream the desktop client passes on only the fixed texts the relay is known to send (`tunnel_proto::close` and `tunnel_proto::deny`). Any other close or denial text is replaced by a generic message before the MCP application sees it, so a compromised relay cannot put instructions of its own in front of the model. When the relay closes a stream before a request was sent, the client also says that the tool did not run.
 
 ## Out of scope
 

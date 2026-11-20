@@ -54,14 +54,9 @@ jobs:
           qualifier=$(date -u +%Y%m%d%H%M%S)
           mvn --batch-mode --no-transfer-progress "-DforceContextQualifier=$qualifier" clean verify
 
-      - name: Run Package-Policy Harness
-        run: |
-          plugin=com.sap.adt.mcp.server.plugin
-          gson="$plugin/gson-2.11.0.jar"
-          classes=$(mktemp -d "$RUNNER_TEMP/package-policy.XXXXXXXX")
-          javac --release 17 -cp "$gson" -sourcepath "$plugin/src" \
-            -d "$classes" tests/PackagePolicyRegression.java
-          java -ea -cp "$classes:$gson" com.sap.adt.mcp.server.PackagePolicyRegression
+      - name: Run Java Harnesses
+        working-directory: ${{ github.workspace }}
+        run: bash java-plugin/sap-adt-mcp-server/tests/run-harnesses.sh
 
       - name: Stage Pages Site
         run: |

@@ -8,7 +8,7 @@ use std::{collections::VecDeque, time::Instant};
 
 use crate::{
     policy::{self, ToolClass},
-    tunnel_proto::{ADMISSION_TTL, Class, Envelope, RelayPolicy},
+    tunnel_proto::{ADMISSION_TTL, Class, Envelope, RelayPolicy, deny},
 };
 
 /// JSON-RPC code of a refusal, as `mcp.rs` uses for a policy denial.
@@ -54,23 +54,23 @@ impl Admissions {
         now: Instant,
     ) -> Result<(), &'static str> {
         if self.pending.len() >= MAX_PENDING {
-            return Err("Too many requests are waiting to be sent.");
+            return Err(deny::TOO_MANY_PENDING);
         }
         if self.last.checked_add(1) != Some(envelope.seq) {
-            return Err("The sequence number is out of order.");
+            return Err(deny::SEQUENCE);
         }
         if envelope.method == "tools/call" {
             let (Some(tool), Some(class)) = (envelope.tool.as_deref(), envelope.class) else {
-                return Err("A tool call needs a tool and an action class.");
+                return Err(deny::INCOMPLETE_CALL);
             };
             let Some(known) = policy::tool_class(tool) else {
-                return Err("The relay does not know this tool.");
+                return Err(deny::UNKNOWN_TOOL);
             };
             if class_of(known) != class {
-                return Err("The action class does not match the tool.");
+                return Err(deny::WRONG_CLASS);
             }
             if !policy.allowed_tools.iter().any(|allowed| allowed == tool) {
-                return Err("The current access policy does not allow this tool.");
+                return Err(deny::NOT_ALLOWED);
             }
         }
         self.last = envelope.seq;

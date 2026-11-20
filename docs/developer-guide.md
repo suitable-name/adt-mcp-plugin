@@ -172,9 +172,9 @@ Retiring the adapter on relay disconnect, view disposal, or replacement clears i
 Follow the [implementation guide](../IMPLEMENTATION.md). Run the commands below from the repository root in PowerShell 7.
 
 ```powershell
-cargo +1.95.0 check --workspace --all-targets
-cargo +1.95.0 test --locked --workspace --all-targets && cargo +1.95.0 clippy --locked --workspace --all-targets -- -D warnings -D clippy::pedantic -D clippy::nursery
-cargo +1.95.0 build --locked --workspace --bins
+cargo +1.99 check --workspace --all-targets
+cargo +1.99 test --locked --workspace --all-targets && cargo +1.99 clippy --locked --workspace --all-targets -- -D warnings -D clippy::pedantic -D clippy::nursery
+cargo +1.99 build --locked --workspace --bins
 ```
 
 Build the Eclipse modules with Maven 3.10.0, JDK 21, and the parent POM's Tycho 5.0.4. The plugin targets Java 17. The build resolves ADT APIs from SAP's public 2024-03 p2 repository alongside the Eclipse target. SAP ADT must also be installed in the runtime Eclipse environment. Keep the bundled Gson JAR at the plugin root. The [Eclipse build and harness commands](verification.md#eclipse-plugin-build) cover both Java checks. Use the [update site guide](eclipse-update-site.md) to install the result or host it on GitHub Pages.

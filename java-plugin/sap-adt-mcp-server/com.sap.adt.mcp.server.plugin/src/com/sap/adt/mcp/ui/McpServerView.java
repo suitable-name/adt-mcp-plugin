@@ -50,7 +50,7 @@ import com.sap.adt.mcp.server.RelayEnrollment;
 import com.sap.adt.mcp.server.RelayIdentity;
 import com.sap.adt.mcp.server.RelayProfileStore;
 import com.sap.adt.mcp.server.ToolExecutor;
-import com.sap.adt.mcp.server.e2e.E2eServices;
+import com.sap.adt.mcp.server.E2eServices;
 import com.sap.adt.mcp.server.e2e.Pairing;
 import com.sap.adt.mcp.server.e2e.PinStore;
 import com.sap.adt.mcp.server.e2e.StreamRequests;

@@ -19,12 +19,12 @@ SAP system ◄──HTTPS── Eclipse workspace ─────outbound WSS + 
 
 ## Build
 
-The Rust package declares Rust 1.95 as its minimum version, edition 2024, and workspace resolver 3. Run the following commands from the repository root in PowerShell 7 with Rust 1.95.0. The first Cargo command generates `Cargo.lock` if this checkout has no lockfile. Keep the resolved lockfile with the tested build.
+The Rust package declares Rust 1.99 as its minimum version (Trillium needs it), edition 2024, and workspace resolver 3. Run the following commands from the repository root in PowerShell 7 with Rust 1.99. The first Cargo command generates `Cargo.lock` if this checkout has no lockfile. Keep the resolved lockfile with the tested build.
 
 ```powershell
-cargo +1.95.0 check --workspace --all-targets
-cargo +1.95.0 test --locked --workspace --all-targets && cargo +1.95.0 clippy --locked --workspace --all-targets -- -D warnings -D clippy::pedantic -D clippy::nursery
-cargo +1.95.0 build --locked --workspace --bins
+cargo +1.99 check --workspace --all-targets
+cargo +1.99 test --locked --workspace --all-targets && cargo +1.99 clippy --locked --workspace --all-targets -- -D warnings -D clippy::pedantic -D clippy::nursery
+cargo +1.99 build --locked --workspace --bins
 ```
 
 The Rust executables are in `target/debug`. Build for each intended platform.

@@ -7,7 +7,8 @@ import org.osgi.framework.BundleContext;
 import com.sap.adt.mcp.preferences.LocalPolicyStore;
 import com.sap.adt.mcp.server.LegacyCalls;
 import com.sap.adt.mcp.server.LocalPolicySource;
-import com.sap.adt.mcp.server.e2e.E2eServices;
+import com.sap.adt.mcp.server.E2eServices;
+import com.sap.adt.mcp.server.SecureBlobStorage;
 
 /**
  * The activator class controls the plug-in life cycle.
@@ -28,6 +29,8 @@ public class Activator extends AbstractUIPlugin {
         // The relay bridge reads the local permissions through this indirection on every call.
         LocalPolicySource.install(LocalPolicyStore::load);
         LegacyCalls.install(LocalPolicyStore::allowUnencrypted);
+        // E2eServices has no Eclipse types: the secure storage for the inner key and the pin list comes from here.
+        E2eServices.useStorage(SecureBlobStorage::new);
         // The inner key and the pin store exist from start-up, so the paired-desktops lists and the permissions
         // page can read them. The stream handler and the pairing gate need a connected SAP session and relay
         // identity, so the MCP view registers them with E2eServices when it connects.

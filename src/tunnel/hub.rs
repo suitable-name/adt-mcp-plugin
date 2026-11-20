@@ -25,14 +25,14 @@ use crate::{
     rt,
     tunnel_proto::{
         Control, Envelope, HANDSHAKE_DEADLINE, MAX_STREAMS_PER_BRIDGE, MAX_STREAMS_PER_DESKTOP,
-        RelayPolicy, Status, decode_data, encode_data,
+        RelayPolicy, Status, close, decode_data, encode_data,
     },
 };
 
 /// Streams without traffic for this long are closed, as MCP sessions were.
 pub(super) const STREAM_IDLE: Duration = Duration::from_hours(8);
 /// Close reason when a stream's grant or policy changed after it was opened.
-pub(super) const ACCESS_CHANGED: &str = "The access rules changed.";
+pub(super) const ACCESS_CHANGED: &str = close::ACCESS_CHANGED;
 /// Longest close reason forwarded from a peer, in characters.
 const MAX_REASON_CHARS: usize = 200;
 
@@ -304,7 +304,7 @@ impl Hub {
         }
         let mut inner = self.lock();
         if inner.closed {
-            return Err("The Eclipse bridge disconnected.");
+            return Err(close::BRIDGE_GONE);
         }
         if inner.streams.len() >= MAX_STREAMS_PER_BRIDGE {
             return Err("This Eclipse endpoint has reached its stream limit.");
@@ -463,11 +463,11 @@ impl Hub {
                 let reason = if !stream.handshaken
                     && now.saturating_duration_since(stream.opened) >= HANDSHAKE_DEADLINE
                 {
-                    "The inner handshake did not complete in time."
+                    close::HANDSHAKE_TIMEOUT
                 } else if stream.admissions.expired(now) {
-                    "An admitted request was not sent in time."
+                    close::ADMISSION_EXPIRED
                 } else if now.saturating_duration_since(stream.last_active) >= STREAM_IDLE {
-                    "The stream was idle for too long."
+                    close::IDLE
                 } else {
                     return None;
                 };
@@ -538,7 +538,7 @@ impl Hub {
                     }
                 }
                 Toward::Violation => {
-                    self.end(stream, "The Eclipse plugin sent an unexpected response.");
+                    self.end(stream, close::UNEXPECTED_RESPONSE);
                 }
                 Toward::Unknown => {}
             },
@@ -578,7 +578,7 @@ impl Hub {
 
     /// The desktop does not keep up (or its tunnel is gone): its stream ends.
     fn drop_slow(&self, stream: u32) {
-        self.end(stream, "The desktop did not keep up with the stream.");
+        self.end(stream, close::SLOW_DESKTOP);
     }
 
     /// Ends a stream from the bridge side: the desktop and the plugin are told.
@@ -912,7 +912,7 @@ mod tests {
         let (hub, _bridge) = hub();
         let (_, a) = open(&hub, 1, 1);
         let (_, b) = open(&hub, 2, 2);
-        hub.close_all("The Eclipse bridge disconnected.");
+        hub.close_all(close::BRIDGE_GONE);
         for (receiver, client_id) in [(a, 1), (b, 2)] {
             assert!(matches!(
                 control(&receiver.try_recv().unwrap()),

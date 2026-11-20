@@ -7,9 +7,9 @@ Use a development SAP system, two packages with known objects, a disposable writ
 Run from the checkout root in PowerShell 7. The first Cargo command resolves a lockfile for a fresh checkout. Once it exists, use the same lockfile for all acceptance runs.
 
 ```powershell
-cargo +1.95.0 check --workspace --all-targets
-cargo +1.95.0 test --locked --workspace --all-targets --all-features && cargo +1.95.0 clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic -D clippy::nursery
-cargo +1.95.0 build --locked --workspace --bins
+cargo +1.99 check --workspace --all-targets
+cargo +1.99 test --locked --workspace --all-targets --all-features && cargo +1.99 clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::pedantic -D clippy::nursery
+cargo +1.99 build --locked --workspace --bins
 ```
 
 The workspace tests exercise certificate and token handling, policy intersections, session ownership, and the desktop stdio path. The link parser is checked against the shared `link-vectors.json`. The desktop integration test uses a local pseudo-terminal for the operator (it mints links with **N**), `enroll --link` for desktops, `/claim` with the link's token for Eclipse identities, `issue-link` for the headless server, and loopback TLS with a mock Eclipse bridge. Allow the test process to start child processes and bind loopback ports.
@@ -162,6 +162,25 @@ Remove-Item Env:SAP_ADT_INTEROP
 ```
 
 On Linux run `SAP_ADT_INTEROP=1 JAVA_HOME=/path/to/jdk cargo test --test interop -- --nocapture`.
+
+### Real plugin end-to-end
+
+`tests/e2e_relay.rs` normally runs the relay and the desktop client against a Rust stand-in for the plugin. With `SAP_ADT_INTEROP=1` it also runs the **real Java plugin bridge** (`RelayBridge`, the stream handler and the pairing, started headless by `java-plugin/sap-adt-mcp-server/tests/PluginHost.java` with in-memory keys and a fake SAP client, no Eclipse) against the real relay and the real `sap-adt-mcp-client`:
+
+1. Alice pairs with a link the plugin minted (`allowUnencrypted=false`) and calls `sap_get_source` through `connect`. The fake SAP received the arguments intact, the result arrives, and the relay's whole stderr holds the tool name but neither the argument nor the result marker.
+2. Bob never paired, so his `connect` uses the legacy `/mcp` path. His `tools/call` fails with `-32002` ("accepts only end-to-end encrypted calls") and nothing reaches SAP.
+3. The plugin restarts with `allowUnencrypted=true` (its keys and pins are in memory, so Alice pairs again). Bob's legacy call now succeeds, which proves the switch and not a broken path.
+4. A **rogue relay** that holds the real relay's server certificate (the plugin pins the CA, so it passes the plugin's check) speaks the bridge protocol to a third plugin. It pairs Alice's key, then: a clear-text `tools/call` is refused with `-32002`; a request whose envelope says `sap_get_source` but whose encrypted message calls `sap_set_source` makes the plugin close the stream without a result; a request with a wrong `seq` closes the stream. No SAP call happens.
+
+Prerequisites: `JAVA_HOME` points at a JDK 17 or newer (`javac` and `java`), the plugin directory holds its bundled `gson-*.jar`, and loopback TCP is available. The test compiles `PluginHost.java` and the plugin classes it uses into a temporary directory and kills the Java processes when it ends. Without `SAP_ADT_INTEROP=1` it prints a note and passes.
+
+```powershell
+$env:JAVA_HOME = Join-Path $env:USERPROFILE '.jdks/jbr-21.0.11'
+$env:SAP_ADT_INTEROP = '1'
+cargo test --test e2e_relay -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw "The real plugin end-to-end test failed with exit code $LASTEXITCODE." }
+Remove-Item Env:SAP_ADT_INTEROP
+```
 
 ## Acceptance Matrix
 

@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      # Runs the Rust/Java interop and the real-plugin end-to-end test as well.
+      SAP_ADT_INTEROP: '1'
+
+    steps:
+      - name: Check Out Sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set Up JDK 21
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.99 --profile minimal
+          rustup default stable
+          rustc --version
+
+      - name: Minimum Supported Rust Version (1.99)
+        run: cargo +1.99 check --locked --all-targets --all-features
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (pedantic and nursery, warnings are errors)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked --all-features --no-fail-fast
+
+  plugin:
+    name: Eclipse Plugin
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check Out Sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: true
+
+      - name: Set Up JDK 21
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Maven 3.10.0
+        env:
+          MAVEN_VERSION: '3.10.0'
+          # SHA-512 published by Apache for the binary tarball.
+          MAVEN_SHA512: 908b1501bfb420bf7c8affb855534a9c407fd6099367bfb9f2f2dcb8e9799102bffb84518cde74c679bd76870247c6528683abdd620581bffa90f95d92d175aa
+        run: |
+          archive="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/$MAVEN_VERSION/$archive"
+          printf '%s  %s\n' "$MAVEN_SHA512" "$archive" | sha512sum --check
+          tar -xzf "$archive"
+          echo "$RUNNER_TEMP/apache-maven-$MAVEN_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Build Plugin (Tycho)
+        working-directory: java-plugin/sap-adt-mcp-server
+        run: mvn --batch-mode --no-transfer-progress clean verify
+
+      - name: Java Harnesses
+        run: bash java-plugin/sap-adt-mcp-server/tests/run-harnesses.sh

@@ -43,6 +43,56 @@ pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 pub const MAX_STREAMS_PER_BRIDGE: usize = 128;
 /// Streams per desktop and endpoint.
 pub const MAX_STREAMS_PER_DESKTOP: usize = 16;
+
+/// Why the relay closes a stream (`Close.reason`).
+///
+/// The desktop client passes a reason on to the MCP application only if it is one of
+/// [`close::ALL`]; any other text becomes a generic message, so a compromised relay cannot put
+/// words of its own in front of the model.
+pub mod close {
+    pub const ACCESS_CHANGED: &str = "The access rules changed.";
+    pub const BRIDGE_GONE: &str = "The Eclipse bridge disconnected.";
+    pub const HANDSHAKE_TIMEOUT: &str = "The inner handshake did not complete in time.";
+    pub const ADMISSION_EXPIRED: &str = "An admitted request was not sent in time.";
+    pub const IDLE: &str = "The stream was idle for too long.";
+    pub const SLOW_DESKTOP: &str = "The desktop did not keep up with the stream.";
+    pub const POLICY_UNAVAILABLE: &str = "The access policy is unavailable.";
+    pub const UNEXPECTED_RESPONSE: &str = "The Eclipse plugin sent an unexpected response.";
+
+    /// Every reason above.
+    pub const ALL: [&str; 8] = [
+        ACCESS_CHANGED,
+        BRIDGE_GONE,
+        HANDSHAKE_TIMEOUT,
+        ADMISSION_EXPIRED,
+        IDLE,
+        SLOW_DESKTOP,
+        POLICY_UNAVAILABLE,
+        UNEXPECTED_RESPONSE,
+    ];
+}
+
+/// Why the relay refuses an `Admit` (`Denied.message`). Like [`close`], the desktop client
+/// passes on only these texts.
+pub mod deny {
+    pub const TOO_MANY_PENDING: &str = "Too many requests are waiting to be sent.";
+    pub const SEQUENCE: &str = "The sequence number is out of order.";
+    pub const INCOMPLETE_CALL: &str = "A tool call needs a tool and an action class.";
+    pub const UNKNOWN_TOOL: &str = "The relay does not know this tool.";
+    pub const WRONG_CLASS: &str = "The action class does not match the tool.";
+    pub const NOT_ALLOWED: &str = "The current access policy does not allow this tool.";
+
+    /// Every reason above, and [`super::close::POLICY_UNAVAILABLE`].
+    pub const ALL: [&str; 7] = [
+        TOO_MANY_PENDING,
+        SEQUENCE,
+        INCOMPLETE_CALL,
+        UNKNOWN_TOOL,
+        WRONG_CLASS,
+        NOT_ALLOWED,
+        super::close::POLICY_UNAVAILABLE,
+    ];
+}
 /// The only data-frame kind: inner TLS bytes.
 pub const DATA_KIND_STREAM: u8 = 0;
 /// Longest method name an envelope may carry.
