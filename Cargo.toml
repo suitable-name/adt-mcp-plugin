@@ -29,7 +29,6 @@ trillium-smol = "0.7"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 ring = "0.17"
-rpassword = "7"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
@@ -43,12 +42,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 x509-parser = "0.18"
 zeroize = "1.9.2"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_IO"] }
 
 [dev-dependencies]
 portable-pty = "0.9"

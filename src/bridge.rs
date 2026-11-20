@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -9,10 +12,12 @@ use crate::{
     rt::timeout,
     security::Pki,
     transport::{PeerCertificate, Transport, Upgrade},
+    tunnel::{Hub, StreamRow},
+    tunnel_proto::{Control, MAX_CONTROL_BYTES},
     web::{Prefixed, Reply},
 };
 use async_tungstenite::{
-    WebSocketStream,
+    WebSocketReceiver, WebSocketSender, WebSocketStream,
     tungstenite::{
         Message,
         handshake::derive_accept_key,
@@ -28,7 +33,11 @@ use smol::{
 use trillium_http::{Headers, KnownHeaderName, Status};
 use uuid::Uuid;
 
-type Socket = WebSocketStream<Prefixed<Transport>>;
+pub type Socket = WebSocketStream<Prefixed<Transport>>;
+/// The sending half of a split [`Socket`].
+pub type SocketSender = WebSocketSender<Prefixed<Transport>>;
+/// The receiving half of a split [`Socket`].
+pub type SocketReceiver = WebSocketReceiver<Prefixed<Transport>>;
 
 const CALL_LIMIT: Duration = Duration::from_secs(600);
 const HEARTBEAT: Duration = Duration::from_secs(20);
@@ -36,6 +45,10 @@ const SESSION_IDLE: Duration = Duration::from_hours(8);
 const MAX_SESSIONS: usize = 128;
 // WebSocket upgrades outlive the HTTP connection permit used by the transport.
 const MAX_BRIDGES: usize = 128;
+/// Messages waiting for the bridge's writer: legacy requests, stream control and data frames.
+const OUTBOUND_QUEUE: usize = 256;
+/// Largest WebSocket message from the plugin (a legacy response may be 8 MiB).
+const MESSAGE_LIMIT: usize = 8 * 1024 * 1024;
 
 pub type Outcome = Result<Value, Value>;
 
@@ -151,6 +164,8 @@ impl Session {
 struct Slot {
     bridge: Client,
     ready: bool,
+    /// The end-to-end streams of this bridge connection.
+    hub: Arc<Hub>,
     sessions: HashMap<Uuid, Session>,
     // Monitoring only.
     peer: SocketAddr,
@@ -224,9 +239,12 @@ impl Registry {
             return Err(Status::TooManyRequests);
         }
         let (bridge, receiver) = Client::channel(Arc::clone(&endpoint));
+        let (to_bridge, outbound) = channel::bounded(OUTBOUND_QUEUE);
+        let hub = Arc::new(Hub::new(Arc::clone(&endpoint), to_bridge));
         slot.insert(Slot {
             bridge,
             ready: false,
+            hub: Arc::clone(&hub),
             sessions: HashMap::new(),
             peer,
             since: Instant::now(),
@@ -238,6 +256,8 @@ impl Registry {
             Reservation {
                 registry: self.clone(),
                 endpoint,
+                hub,
+                outbound,
             },
             receiver,
         ))
@@ -245,6 +265,27 @@ impl Registry {
 
     pub(super) fn online(&self, endpoint: &str) -> bool {
         self.slots().get(endpoint).is_some_and(|slot| slot.ready)
+    }
+
+    /// The stream hub of a ready bridge. Streams open only on it, and only if the plugin
+    /// announced `e2e` support.
+    pub(crate) fn hub(&self, endpoint: &str) -> Option<Arc<Hub>> {
+        self.slots()
+            .get(endpoint)
+            .filter(|slot| slot.ready)
+            .map(|slot| Arc::clone(&slot.hub))
+    }
+
+    /// Live end-to-end streams of all bridges, for the operator interface.
+    pub(crate) fn stream_snapshot(&self) -> Vec<StreamRow> {
+        let hubs: Vec<Arc<Hub>> = self
+            .slots()
+            .values()
+            .map(|slot| Arc::clone(&slot.hub))
+            .collect();
+        let mut rows: Vec<StreamRow> = hubs.iter().flat_map(|hub| hub.snapshot()).collect();
+        rows.sort_by_key(|row| row.since);
+        rows
     }
 
     pub(super) fn initialize(
@@ -299,6 +340,7 @@ impl Registry {
                     peer: slot.peer,
                     since: slot.since,
                     ready: slot.ready,
+                    e2e: slot.hub.e2e(),
                     busy: slot.bridge.admission.available_permits() == 0,
                     calls: slot.calls,
                     last_call: slot.last_call.clone(),
@@ -357,6 +399,9 @@ impl Registry {
 struct Reservation {
     registry: Registry,
     endpoint: Arc<str>,
+    hub: Arc<Hub>,
+    /// Everything that goes to the plugin: legacy requests and stream frames.
+    outbound: channel::Receiver<Message>,
 }
 
 impl Reservation {
@@ -381,6 +426,8 @@ pub struct BridgeRow {
     pub peer: SocketAddr,
     pub since: Instant,
     pub ready: bool,
+    /// The plugin announced end-to-end support (`e2e: 1`) in its hello.
+    pub e2e: bool,
     /// A call is being processed by Eclipse right now.
     pub busy: bool,
     pub calls: u64,
@@ -401,7 +448,7 @@ pub struct SessionRow {
 }
 
 /// What a call does, for monitoring: the tool name for `tools/call`, else the method.
-pub(crate) fn activity(method: &str, params: &Value) -> String {
+pub fn activity(method: &str, params: &Value) -> String {
     match params["name"].as_str() {
         Some(tool) if method == "tools/call" => tool.to_owned(),
         _ => method.to_owned(),
@@ -411,6 +458,8 @@ pub(crate) fn activity(method: &str, params: &Value) -> String {
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.registry.slots().remove(&self.endpoint);
+        // Every stream of this connection ends, and its desktop is told.
+        self.hub.close_all("The Eclipse bridge disconnected.");
     }
 }
 
@@ -455,17 +504,21 @@ pub fn upgrade(
                 );
             }
         };
-    let reply = Reply::from(Status::SwitchingProtocols)
+    (switching(accept), Some(Bridge { reservation, calls }))
+}
+
+/// The `101` answer of a WebSocket upgrade with this `Sec-WebSocket-Accept` value.
+pub fn switching(accept: String) -> Reply {
+    Reply::from(Status::SwitchingProtocols)
         .with_header(KnownHeaderName::Connection, "upgrade")
         .with_header(KnownHeaderName::Upgrade, "websocket")
-        .with_header(KnownHeaderName::SecWebsocketAccept, accept);
-    (reply, Some(Bridge { reservation, calls }))
+        .with_header(KnownHeaderName::SecWebsocketAccept, accept)
 }
 
 /// Validates an HTTP/1.1 WebSocket upgrade request, with the checks and
 /// statuses of axum's former `WebSocketUpgrade` extractor. Returns the
 /// `Sec-WebSocket-Accept` value, or the rejection.
-fn handshake(headers: &Headers) -> Result<String, &'static str> {
+pub fn handshake(headers: &Headers) -> Result<String, &'static str> {
     if !headers
         .token_iter(KnownHeaderName::Connection)
         .any(|token| token.eq_ignore_ascii_case("upgrade"))
@@ -484,82 +537,191 @@ fn handshake(headers: &Headers) -> Result<String, &'static str> {
     Ok(derive_accept_key(key.as_bytes()))
 }
 
-/// Run the bridge on an upgraded connection.
-pub async fn serve_upgraded(
-    mut upgrade: Upgrade,
-    bridge: Bridge,
-    pki: &Pki,
-    cert: &PeerCertificate,
-) {
+/// The server side of a WebSocket on an upgraded connection, with messages up to `limit` bytes.
+pub async fn socket(mut upgrade: Upgrade, limit: usize) -> Socket {
     let config = WebSocketConfig::default()
-        .max_message_size(Some(8 * 1024 * 1024))
-        .max_frame_size(Some(8 * 1024 * 1024));
+        .max_message_size(Some(limit))
+        .max_frame_size(Some(limit));
     let buffered = upgrade.take_buffer();
     let io = Prefixed::new(buffered, upgrade.into_transport());
-    let socket = WebSocketStream::from_raw_socket(io, Role::Server, Some(config)).await;
+    WebSocketStream::from_raw_socket(io, Role::Server, Some(config)).await
+}
+
+/// Run the bridge on an upgraded connection.
+pub async fn serve_upgraded(upgrade: Upgrade, bridge: Bridge, pki: &Pki, cert: &PeerCertificate) {
+    let socket = socket(upgrade, MESSAGE_LIMIT).await;
     serve(socket, bridge, pki, cert).await;
 }
 
-async fn serve(mut socket: Socket, bridge: Bridge, pki: &Pki, cert: &PeerCertificate) {
+async fn serve(socket: Socket, bridge: Bridge, pki: &Pki, cert: &PeerCertificate) {
     let Bridge { reservation, calls } = bridge;
-    serve_connected(&mut socket, &reservation, &calls, pki, cert).await;
+    serve_connected(socket, &reservation, &calls, pki, cert).await;
     // Dropping a closed channel's receiver would leave queued calls (and their
     // reply senders) alive while a client handle exists, so release them now.
     calls.close();
     while calls.try_recv().is_ok() {}
 }
 
+// One bridge connection is three futures raced in one task, and the first to end ends the
+// connection:
+// - the writer sends everything queued for the plugin: legacy requests, stream control frames
+//   and data frames, in queue order;
+// - the reader routes what the plugin sends: stream frames to the hub, legacy replies to the
+//   driver, which owns the strictly one-at-a-time legacy exchange;
+// - the driver runs `relay/hello`, the serialized legacy calls and the heartbeat.
 async fn serve_connected(
-    socket: &mut Socket,
+    socket: Socket,
     reservation: &Reservation,
     calls: &channel::Receiver<Call>,
     pki: &Pki,
     cert: &PeerCertificate,
 ) {
-    let mut id = 1;
+    let (sink, stream) = socket.split();
+    let legacy = Legacy::new();
+    let connected = AtomicBool::new(false);
+    future::race(
+        write_loop(sink, &reservation.outbound),
+        future::race(
+            read_loop(stream, &reservation.hub, &legacy),
+            drive(reservation, calls, &legacy, pki, cert, &connected),
+        ),
+    )
+    .await;
+    if connected.load(Ordering::Acquire) {
+        tracing::info!(endpoint = %reservation.endpoint, "Eclipse bridge disconnected.");
+    }
+}
+
+/// The legacy JSON-RPC exchange, shared by the reader (which routes replies) and the driver
+/// (which sends one request at a time).
+struct Legacy {
+    replies_in: channel::Sender<String>,
+    replies: channel::Receiver<String>,
+    /// A request was sent and its reply has not been taken yet.
+    awaiting: AtomicBool,
+}
+
+impl Legacy {
+    fn new() -> Self {
+        let (replies_in, replies) = channel::bounded(1);
+        Self {
+            replies_in,
+            replies,
+            awaiting: AtomicBool::new(false),
+        }
+    }
+}
+
+async fn write_loop(mut sink: SocketSender, outbound: &channel::Receiver<Message>) {
+    while let Ok(message) = outbound.recv().await {
+        if sink.send(message).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Ends (and so ends the bridge) when the plugin closes the socket or sends something this
+/// relay does not accept, such as a legacy reply nobody asked for.
+async fn read_loop(mut stream: SocketReceiver, hub: &Hub, legacy: &Legacy) {
+    while let Some(Ok(message)) = stream.next().await {
+        match message {
+            Message::Ping(payload) => {
+                // Only a reader sees the ping, so the reader answers it.
+                let _ = hub.try_queue(Message::Pong(payload));
+            }
+            Message::Pong(_) => {}
+            Message::Binary(frame) if hub.e2e() => {
+                if !hub.on_plugin_data(&frame) {
+                    return;
+                }
+            }
+            Message::Text(text) => {
+                // A stream control frame has a top-level `type`; a JSON-RPC reply never does.
+                if hub.e2e()
+                    && text.len() <= MAX_CONTROL_BYTES
+                    && let Ok(control) = Control::decode(&text)
+                {
+                    hub.on_plugin_control(control);
+                } else if !legacy.awaiting.load(Ordering::Acquire)
+                    || legacy.replies_in.try_send(text.to_string()).is_err()
+                {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
+enum Event {
+    Call(Call),
+    Heartbeat,
+}
+
+/// `relay/hello`. `false` if the plugin does not confirm package policies.
+async fn greet(hub: &Hub, legacy: &Legacy) -> bool {
     let hello = exchange(
-        socket,
-        id,
+        hub,
+        legacy,
+        1,
         "relay/hello",
-        Value::Null,
+        // Version 2: every bridge call carries `relayAllowedTools` next to the package scopes.
+        json!({"policyVersion": 2}),
         Instant::now() + HEARTBEAT,
     )
     .await;
-    if !matches!(hello, Ok(Ok(ref capabilities)) if capabilities["policyVersion"].as_u64() == Some(1))
-    {
-        tracing::warn!(
-            "Eclipse did not confirm support for package policies. Upgrade the plugin and reconnect."
-        );
+    let capabilities = match hello {
+        Ok(Ok(capabilities)) if matches!(capabilities["policyVersion"].as_u64(), Some(1 | 2)) => {
+            capabilities
+        }
+        _ => {
+            tracing::warn!(
+                "Eclipse did not confirm support for package policies. Upgrade the plugin and reconnect."
+            );
+            return false;
+        }
+    };
+    // A plugin that announces `e2e: 1` also accepts end-to-end streams on this connection.
+    if capabilities["e2e"].as_u64() == Some(1) {
+        hub.set_e2e();
+    }
+    true
+}
+
+async fn drive(
+    reservation: &Reservation,
+    calls: &channel::Receiver<Call>,
+    legacy: &Legacy,
+    pki: &Pki,
+    cert: &PeerCertificate,
+    connected: &AtomicBool,
+) {
+    let hub = &*reservation.hub;
+    if !greet(hub, legacy).await {
         return;
     }
+    let mut id = 1;
     reservation.mark_ready();
-    tracing::info!(endpoint = %reservation.endpoint, "Eclipse bridge connected.");
+    connected.store(true, Ordering::Release);
+    tracing::info!(endpoint = %reservation.endpoint, e2e = hub.e2e(), "Eclipse bridge connected.");
     loop {
         id += 1;
         // `race` polls its futures fairly, like the former `select!`.
         let event = future::race(
-            async { Event::Socket(socket.next().await) },
-            future::race(
-                async {
-                    match calls.recv().await {
-                        Ok(call) => Event::Call(call),
-                        // No sender is left: only the socket and the heartbeat can wake us.
-                        Err(_) => future::pending().await,
-                    }
-                },
-                async {
-                    Timer::after(HEARTBEAT).await;
-                    Event::Heartbeat
-                },
-            ),
+            async {
+                match calls.recv().await {
+                    Ok(call) => Event::Call(call),
+                    // No sender is left: only the socket and the heartbeat can wake us.
+                    Err(_) => future::pending().await,
+                }
+            },
+            async {
+                Timer::after(HEARTBEAT).await;
+                Event::Heartbeat
+            },
         )
         .await;
         match event {
-            Event::Socket(message) => {
-                if !matches!(message, Some(Ok(Message::Ping(_) | Message::Pong(_)))) {
-                    break;
-                }
-            }
             Event::Call(call) => {
                 if !pki.authorize(&cert.der, "eclipse") {
                     let _ = call.reply.try_send(Err(error(
@@ -572,7 +734,7 @@ async fn serve_connected(
                     continue;
                 }
                 reservation.note_call(activity(call.method, &call.params));
-                match exchange(socket, id, call.method, call.params, call.deadline).await {
+                match exchange(hub, legacy, id, call.method, call.params, call.deadline).await {
                     Ok(result) => {
                         let _ = call.reply.try_send(result);
                     }
@@ -582,7 +744,15 @@ async fn serve_connected(
             Event::Heartbeat => {
                 if !pki.authorize(&cert.der, "eclipse")
                     || !matches!(
-                        exchange(socket, id, "ping", Value::Null, Instant::now() + HEARTBEAT).await,
+                        exchange(
+                            hub,
+                            legacy,
+                            id,
+                            "ping",
+                            Value::Null,
+                            Instant::now() + HEARTBEAT
+                        )
+                        .await,
                         Ok(Ok(_))
                     )
                 {
@@ -591,19 +761,14 @@ async fn serve_connected(
             }
         }
     }
-    tracing::info!(endpoint = %reservation.endpoint, "Eclipse bridge disconnected.");
-}
-
-enum Event {
-    Socket(Option<Result<Message, async_tungstenite::tungstenite::Error>>),
-    Call(Call),
-    Heartbeat,
 }
 
 // Serializing ADT calls also bounds in-flight work. A lost or invalid reply
-// closes this bridge so a later call can never consume an earlier reply.
+// closes this bridge so a later call can never consume an earlier reply. Stream frames
+// share the connection but never take part in this exchange.
 async fn exchange(
-    socket: &mut Socket,
+    hub: &Hub,
+    legacy: &Legacy,
     id: u64,
     method: &str,
     params: Value,
@@ -613,21 +778,21 @@ async fn exchange(
     if !params.is_null() {
         request["params"] = params;
     }
-    timeout(deadline.saturating_duration_since(Instant::now()), async {
-        socket
-            .send(Message::Text(request.to_string().into()))
+    // Set before sending: the reader accepts a legacy reply only while one is expected.
+    legacy.awaiting.store(true, Ordering::Release);
+    let outcome = timeout(deadline.saturating_duration_since(Instant::now()), async {
+        if !hub
+            .send_message(Message::Text(request.to_string().into()))
             .await
-            .map_err(|_| ())?;
-        loop {
-            match socket.next().await {
-                Some(Ok(Message::Text(text))) => return decode_reply(&text, id),
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                _ => return Err(()),
-            }
+        {
+            return Err(());
         }
+        let text = legacy.replies.recv().await.map_err(|_| ())?;
+        decode_reply(&text, id)
     })
-    .await
-    .map_err(|_| ())?
+    .await;
+    legacy.awaiting.store(false, Ordering::Release);
+    outcome.map_err(|_| ())?
 }
 
 fn decode_reply(text: &str, id: u64) -> Result<Outcome, ()> {
@@ -690,6 +855,7 @@ mod tests {
         assert_eq!(session.activity, "sap_search_object");
         drop(bridge);
         assert!(registry.snapshot().is_empty());
+        drop(registry);
     }
 
     #[test]
@@ -765,6 +931,26 @@ mod tests {
         drop(connections.pop());
         let _replacement = registry.reserve("overflow".into(), PEER).unwrap();
         assert!(registry.session(Some("0"), id, &[1; 32]).is_ok());
+        drop(registry);
+    }
+
+    #[test]
+    fn streams_use_the_hub_of_a_ready_bridge_and_end_with_its_connection() {
+        let registry = Registry::default();
+        let (bridge, _calls) = registry.reserve("endpoint".into(), PEER).unwrap();
+        assert!(registry.hub("endpoint").is_none());
+        bridge.mark_ready();
+        let hub = registry.hub("endpoint").unwrap();
+        assert_eq!(hub.endpoint(), "endpoint");
+        assert!(!hub.e2e());
+        assert!(registry.hub("other").is_none());
+        assert!(registry.stream_snapshot().is_empty());
+        hub.set_e2e();
+        // A frame for a stream nobody opened is ignored; a malformed data frame ends the bridge.
+        assert!(hub.on_plugin_data(&crate::tunnel_proto::encode_data(9, &[1]).unwrap()));
+        assert!(!hub.on_plugin_data(&[0, 0, 0]));
+        drop(bridge);
+        assert!(registry.hub("endpoint").is_none());
         drop(registry);
     }
 

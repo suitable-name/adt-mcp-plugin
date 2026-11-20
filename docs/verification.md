@@ -12,7 +12,7 @@ cargo +1.95.0 test --locked --workspace --all-targets --all-features && cargo +1
 cargo +1.95.0 build --locked --workspace --bins
 ```
 
-The workspace tests exercise certificate and token handling, policy intersections, session ownership, and the desktop stdio path. The desktop integration test uses a local pseudo-terminal for operator input and loopback TLS with a mock Eclipse bridge. Allow the test process to start child processes and bind loopback ports.
+The workspace tests exercise certificate and token handling, policy intersections, session ownership, and the desktop stdio path. The link parser is checked against the shared `link-vectors.json`. The desktop integration test uses a local pseudo-terminal for the operator (it mints links with **N**), `enroll --link` for desktops, `/claim` with the link's token for Eclipse identities, `issue-link` for the headless server, and loopback TLS with a mock Eclipse bridge. Allow the test process to start child processes and bind loopback ports.
 
 ### Eclipse Plugin Build
 
@@ -48,17 +48,132 @@ if ($LASTEXITCODE -ne 0) { throw "Harness compilation failed with exit code $LAS
 if ($LASTEXITCODE -ne 0) { throw "The package-policy harness failed with exit code $LASTEXITCODE." }
 ```
 
+### Java Local-Permissions Harness
+
+Run this block from the checkout root in the same PowerShell session. It exercises the local Eclipse permissions and the plugin's role as the authority with in-memory SAP responses: a local read-only policy blocks a write the relay allows, a tool missing from `relayAllowedTools` is refused even when the relay forwarded it, local package patterns intersect with the relay's scopes, the lock flag makes the store read-only, and `RelayRequests` verifies the shared tool table when it is built. This harness and the package-policy harness read the table from `resources/tools.json` in the source tree (override with `-Dtools.json=<path>`) and need no Eclipse jars.
+
+```powershell
+$classes = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "sap-adt-local-policy-$([guid]::NewGuid())")
+& "$env:JAVA_HOME/bin/javac.exe" --release 17 -cp $gson -sourcepath "$plugin/src" -d $classes.FullName "$eclipseProject/tests/LocalPolicyRegression.java"
+if ($LASTEXITCODE -ne 0) { throw "Harness compilation failed with exit code $LASTEXITCODE." }
+& "$env:JAVA_HOME/bin/java.exe" -ea -cp "$($classes.FullName);$gson" com.sap.adt.mcp.server.LocalPolicyRegression
+if ($LASTEXITCODE -ne 0) { throw "The local-permissions harness failed with exit code $LASTEXITCODE." }
+```
+
+### Java Legacy-Switch Harness
+
+Run this block from the checkout root in the same PowerShell session. It exercises the preference **Allow unencrypted relay calls** (`relay.allowUnencrypted`): with the switch off, a legacy `tools/list` and `tools/call` are refused with `-32002` and the text "This Eclipse accepts only end-to-end encrypted calls. Pair this desktop with Pair Desktop in the MCP view.", the refusal is logged with the layer "this Eclipse's encryption setting", and `relay/hello` and `ping` still answer; with it on, behaviour is unchanged; a change applies to the next call; a locked administrator value wins over the user's value; an unreadable value counts as off. It needs no Eclipse jars.
+
+```powershell
+$classes = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "sap-adt-legacy-switch-$([guid]::NewGuid())")
+& "$env:JAVA_HOME/bin/javac.exe" --release 17 -cp $gson -sourcepath "$plugin/src" -d $classes.FullName "$eclipseProject/tests/LegacySwitchRegression.java"
+if ($LASTEXITCODE -ne 0) { throw "Harness compilation failed with exit code $LASTEXITCODE." }
+& "$env:JAVA_HOME/bin/java.exe" -ea -cp "$($classes.FullName);$gson" com.sap.adt.mcp.server.LegacySwitchRegression
+if ($LASTEXITCODE -ne 0) { throw "The legacy-switch harness failed with exit code $LASTEXITCODE." }
+```
+
+### Java Link Harness
+
+The link parser must agree with the Rust parser, so this harness reads the shared vectors in `link-vectors.json`: every valid vector must parse to exactly the listed fields and round-trip through build and parse, and every invalid vector must fail with exactly the listed error code. Run it in the same PowerShell session.
+
+```powershell
+$classes = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "sap-adt-link-$([guid]::NewGuid())")
+& "$env:JAVA_HOME/bin/javac.exe" --release 17 -cp $gson -sourcepath "$plugin/src" -d $classes.FullName "$eclipseProject/tests/RelayLinkRegression.java"
+if ($LASTEXITCODE -ne 0) { throw "Harness compilation failed with exit code $LASTEXITCODE." }
+& "$env:JAVA_HOME/bin/java.exe" -ea -cp "$($classes.FullName);$gson" com.sap.adt.mcp.server.RelayLinkRegression "$eclipseProject/tests/link-vectors.json"
+if ($LASTEXITCODE -ne 0) { throw "The link harness failed with exit code $LASTEXITCODE." }
+```
+
+### Java Enrollment Harness
+
+This harness checks that the enrollment trust manager accepts a chain only when it contains the CA pinned by the link's token (and the pinned CA issued the leaf), refuses any other chain before a secret could be sent, and maps an eclipse enrollment link to the bridge URL and registration origin. It uses fixed test certificates and needs no network.
+
+```powershell
+$classes = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "sap-adt-enroll-$([guid]::NewGuid())")
+& "$env:JAVA_HOME/bin/javac.exe" --release 17 -cp $gson -sourcepath "$plugin/src" -d $classes.FullName "$eclipseProject/tests/RelayEnrollmentRegression.java"
+if ($LASTEXITCODE -ne 0) { throw "Harness compilation failed with exit code $LASTEXITCODE." }
+& "$env:JAVA_HOME/bin/java.exe" -ea -cp "$($classes.FullName);$gson" com.sap.adt.mcp.server.RelayEnrollmentRegression
+if ($LASTEXITCODE -ne 0) { throw "The enrollment harness failed with exit code $LASTEXITCODE." }
+```
+
+### Java Pairing Harness
+
+Run this block in the same PowerShell session. It exercises the plugin side of pairing with an injected clock and confirmation dialog: a link is single use and expires after 5 minutes, a new link cancels the previous one, a wrong secret is refused (and five wrong secrets burn the link), a refused or unanswered dialog refuses and burns the secret, the token's second half equals the plugin's inner-key fingerprint, labels from the relay are cleaned, and no secret reaches the log. It needs no network and no Eclipse jars.
+
+```powershell
+$classes = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "sap-adt-pairing-$([guid]::NewGuid())")
+& "$env:JAVA_HOME/bin/javac.exe" --release 17 -cp $gson -sourcepath "$plugin/src" -d $classes.FullName "$eclipseProject/tests/PairingRegression.java"
+if ($LASTEXITCODE -ne 0) { throw "Harness compilation failed with exit code $LASTEXITCODE." }
+& "$env:JAVA_HOME/bin/java.exe" -ea -cp "$($classes.FullName);$gson" com.sap.adt.mcp.server.PairingRegression
+if ($LASTEXITCODE -ne 0) { throw "The pairing harness failed with exit code $LASTEXITCODE." }
+```
+
+### Java Stream-Requests Harness
+
+Run this block from the checkout root in the same PowerShell session. It drives the encrypted-stream MCP session with an in-memory SAP client: `initialize`, then `tools/list` and `tools/call` through the execution path the legacy bridge shares, calls before `initialize` refused, a per-desktop restriction (read-only, tool list, package patterns) applying to its own key fingerprint only, the relay's allowed tools and package scopes still applying, and an unpinned peer limited to `pair/claim` with one generic refusal. It reads the tool table like the local-permissions harness (override with `-Dtools.json=<path>`).
+
+```powershell
+$classes = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "sap-adt-streams-$([guid]::NewGuid())")
+& "$env:JAVA_HOME/bin/javac.exe" --release 17 -cp $gson -sourcepath "$plugin/src" -d $classes.FullName "$eclipseProject/tests/StreamRequestsRegression.java"
+if ($LASTEXITCODE -ne 0) { throw "Harness compilation failed with exit code $LASTEXITCODE." }
+& "$env:JAVA_HOME/bin/java.exe" -ea -cp "$($classes.FullName);$gson" com.sap.adt.mcp.server.StreamRequestsRegression
+if ($LASTEXITCODE -ne 0) { throw "The stream-requests harness failed with exit code $LASTEXITCODE." }
+```
+
+### Java Tool-Catalog Harness
+
+Run this block in the same session as the previous one. The harness instantiates all 15 tools, compares each declared class with `resources/tools.json`, checks the package-awareness and component entries, and confirms that `ToolCatalog.verify` rejects a mismatching or unlisted tool. The plugin root is on the class path so the bundled `/resources/tools.json` resolves. The Rust side is covered by the `policy` unit tests in `cargo test`.
+
+```powershell
+$tools = Join-Path $plugin 'resources/tools.json'
+$classes = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "sap-adt-tools-$([guid]::NewGuid())")
+& "$env:JAVA_HOME/bin/javac.exe" --release 17 -cp $gson -sourcepath "$plugin/src" -d $classes.FullName "$eclipseProject/tests/ToolCatalogRegression.java"
+if ($LASTEXITCODE -ne 0) { throw "Harness compilation failed with exit code $LASTEXITCODE." }
+& "$env:JAVA_HOME/bin/java.exe" -ea -cp "$($classes.FullName);$gson;$plugin" com.sap.adt.mcp.tools.ToolCatalogRegression $tools
+if ($LASTEXITCODE -ne 0) { throw "The tool-catalog harness failed with exit code $LASTEXITCODE." }
+```
+
+### Java Tunnel Harnesses
+
+Three harnesses cover the end-to-end tunnel in the plugin (package `com.sap.adt.mcp.server.e2e`). `TunnelProtocolRegression` round-trips the golden control frames copied from `src/tunnel_proto.rs` byte for byte and checks the envelope rules, data-frame and message-reader limits and seeded random input. `InnerKeysRegression` checks that the hand-written DER certificate parses with `CertificateFactory`, verifies, and keeps a stable SPKI fingerprint, and that the key storage never silently rotates a damaged identity. `InnerChannelRegression` runs a JDK `SSLEngine` client (TLS 1.3, its own key) against the plugin's inner channel: a pinned key is accepted, an unpinned key and another cipher suite are refused, an open pairing gate admits an unknown key that may then only send `pair/claim`, and through the stream table a changed envelope, a wrong `seq`, an unannounced message and a relay identity change all close the stream, while each response carries the status `ok`, `error` or `denied`. The last harness reads the shared tool table from the source tree, so run all three from the checkout root in the same PowerShell session (override the table with `-Dtools.json=<path>`).
+
+```powershell
+foreach ($name in 'TunnelProtocolRegression', 'InnerKeysRegression', 'InnerChannelRegression') {
+    $classes = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "sap-adt-$name-$([guid]::NewGuid())")
+    & "$env:JAVA_HOME/bin/javac.exe" --release 17 -cp $gson -sourcepath "$plugin/src" -d $classes.FullName "$eclipseProject/tests/$name.java"
+    if ($LASTEXITCODE -ne 0) { throw "Harness compilation failed with exit code $LASTEXITCODE." }
+    & "$env:JAVA_HOME/bin/java.exe" -ea -cp "$($classes.FullName);$gson" "com.sap.adt.mcp.server.e2e.$name"
+    if ($LASTEXITCODE -ne 0) { throw "The $name harness failed with exit code $LASTEXITCODE." }
+}
+```
+
+### Rust and Java TLS interop
+
+The Rust client's inner TLS (`src/inner_tls.rs` in the shared library, the same code the desktop client runs) connects over loopback TCP to the plugin's real `InnerChannel`, served by `java-plugin/sap-adt-mcp-server/tests/InteropServer.java`. The test checks that the handshake completes with TLS 1.3 and `TLS_AES_256_GCM_SHA384`, that the key the client sees equals the server's `PIN` line, that two length-prefixed JSON-RPC messages (one of about 180 KB) are echoed unchanged, that a client key the server has not pinned is refused, that a pairing-mode server (`any`) accepts an unknown client key, and that a client with a wrong server pin fails with the mismatch flag set.
+
+Prerequisites: `JAVA_HOME` points at a JDK 17 or newer (`javac` and `java`), the plugin directory holds its bundled `gson-*.jar`, and loopback TCP is available. The test compiles the harness and the plugin classes it uses into a temporary directory and kills the Java process when it ends. Without `SAP_ADT_INTEROP=1` it prints a note and passes, so a plain `cargo test` needs no Java.
+
+```powershell
+$env:JAVA_HOME = Join-Path $env:USERPROFILE '.jdks/jbr-21.0.11'
+$env:SAP_ADT_INTEROP = '1'
+cargo test --test interop -- --nocapture
+if ($LASTEXITCODE -ne 0) { throw "The interop test failed with exit code $LASTEXITCODE." }
+Remove-Item Env:SAP_ADT_INTEROP
+```
+
+On Linux run `SAP_ADT_INTEROP=1 JAVA_HOME=/path/to/jdk cargo test --test interop -- --nocapture`.
+
 ## Acceptance Matrix
 
 | Check | Procedure | Expected Result |
 | --- | --- | --- |
-| Registration closed | Start `serve` without flags. Attempt a new desktop enrollment. | Enrollment stays closed. No pending row or token appears. |
-| Operator toggle | Press **O** in Enrollment, submit a request from another workstation, compare the displayed full ID and role, then deny it. | The request disappears and the workstation receives no identity. |
-| Initial open state | Restart interactively with `--issue-token`. | Enrollment starts open. **O** closes it. A later restart without the flag starts closed again. |
-| Two-party enrollment | Approve one Eclipse and one desktop request. Enter each operator-issued token at its respective workstation. Try an expired or already claimed token. | Only the valid single-use claim issues a profile. The operator can identify both certificates in Clients. |
-| Unattended headless | Stop the TUI, restart with `--headless` and the same PKI. Reconnect existing clients and try a fresh enrollment. | Logs go to stderr, the enrollment port stays closed, and existing clients use the saved policy. |
-| Headless operator console | From an attached terminal, start `serve --pki <dir> --headless --issue-token` with stdout and stderr redirected to separate files. Deny one request. Compare another requester’s full ID, role, and label, then enter `approve <number>` using the matching console row. Claim the displayed token. | The prompt and token appear on the operator terminal. Neither capture contains the token. Normal diagnostics appear in the stderr capture. The denied requester receives no identity, and the approved requester can connect. |
-| Missing operator terminal | Launch the combined flags in a service or CI session without a controlling terminal. | Startup fails before either listener accepts connections. Plain `--headless` can still serve existing identities in that environment. |
+| No link, no enrollment | Start `serve` and post a `/claim` with a made-up token, or run `enroll --link` with a link that was never minted. Also request the removed `/request` endpoint. | One generic refusal (403) for the claim and 404 for `/request`. No row appears and nothing is issued. |
+| Mint and enroll | Press **N** in Enrollment, choose `desktop`, type a label, copy the link with **C**, and run `enroll --link` on a workstation. Repeat with an `eclipse` link and the Eclipse **Enrollment link** field. | Each link issues exactly one profile for its role and label. The tab and log show "label (role) enrolled from peer". The dialog hides the link on Esc. The operator can identify both certificates in Clients. |
+| Link lifetime and reuse | Claim a link twice, let a link run past its 10 minutes, and cancel another with **X** before it is claimed. | The first claim works, and every later attempt gets the generic refusal. The cancelled and expired links issue nothing. |
+| Pinned CA | Edit a link so its `e` address points at another TLS server (a different CA), or change a symbol of its token after the first 90 characters. | The client stops with "wrong relay or attacker in the middle" before any secret is sent. The relay still has the link outstanding. |
+| Outstanding limit | Mint 16 links without claiming them, then try a 17th in the TUI and with `issue-link`. | Both refuse with the limit message. Cancelling one frees a slot. |
+| Unattended headless | Stop the TUI, restart with `--headless` and the same PKI. Reconnect existing clients and mint a fresh link with `issue-link`. | Logs go to stderr, the enrollment port stays open for minted links, and existing clients use the saved policy. |
+| Headless `issue-link` | On the relay's machine run `issue-link --pki <dir> --role desktop --label "Anna Laptop"` with stdout and stderr redirected to separate files, then enroll with the printed link. Try `POST /issue` without the secret, with a wrong secret, and with an `Origin` header. | Standard output holds only the link and stderr no link or token. Enrollment succeeds once. Every unauthorized `/issue` call gets 403. `issue.secret` is owner-only. |
 | Existing ADT project | Authenticate a development ABAP project through ADT, open **Select ABAP Project**, choose it from the Eclipse selector, and connect the relay. Read a known object through the desktop host. Repeat with a project that needs login. | The existing authenticated connection is usable. ADT presents its normal login dialog only when needed, and tool results match the chosen project. |
 | Canceled project selection or login | Cancel the project selector, then repeat and cancel a required native login dialog. | No new relay connection is created and no partially authenticated adapter replaces a usable selection. The view remains usable for a later explicit selection. |
 | Project binding | While the relay is connected, open an editor and select a Project Explorer item belonging to another ABAP project. Request an object that distinguishes the systems. | Requests continue to use the explicitly selected project. The operator must disconnect before changing that selection. |
@@ -82,10 +197,10 @@ Collect screenshots of the Enrollment list, Clients, the Access Rules editor, Lo
 
 | Symptom | Where to Look |
 | --- | --- |
-| Operator terminal unavailable | Use plain `--headless` for an unattended service. For headless enrollment, launch the combined flags in a session with a usable operator terminal under the same service identity. |
-| Startup fails to bind | Check the configured addresses, port conflicts, and service permissions. The TUI and the headless approval console use distinct data and enrollment ports. |
-| Request missing | Check registration state, reachability of the enrollment port, and the registration URL. Use **Enrollment** in the TUI or `pending` on the approval console. Plain `--headless` leaves this port unbound. |
-| Enrollment reports a wrong CA, invalid token, or hostname | Compare the full local request ID and issued token over the trusted channel. Verify the enrollment hostname and the DNS or IP in the server certificate. Reapply and approve a new request if the grant expired. |
+| `issue-link` fails | Run it on the relay's machine with the PKI directory `serve` was started with, and pass `--relay <host:port>` if the enrollment listener is not on `127.0.0.1:8788`. `issue.secret` is recreated at every `serve` start. |
+| Startup fails to bind | Check the configured addresses, port conflicts, and service permissions. The data and enrollment listeners need distinct ports. |
+| Link refused | The client prints one generic refusal for a wrong, used, expired or cancelled link. Check **Enrollment** in the TUI for the outstanding link, then mint a new one. |
+| Enrollment reports a wrong relay, wrong CA, or hostname | "Wrong relay or attacker in the middle" means the CA the relay presented differs from the link's token: check the link's origin and the `--public-enrollment` address. For a hostname error, verify the enrollment host in the link against the DNS or IP in the server certificate. |
 | Identity rejected after restart | Check the service account and PKI directory, leaf expiration, role, and fingerprint in Clients. A desktop identity accesses `/mcp`; an Eclipse identity uses `/bridge`. |
 | No tools or fewer tools than expected | Select an available ADT project in the updated Eclipse plugin and connect the relay, then inspect global and desktop policy. A restricted empty list allows nothing. Reconnect a host that caches its discovery results. |
 | Scoped lookup returns no result | Compare the object's owning package with both allowlists. Missing or ambiguous SAP ownership metadata prevents a scoped result. Package prefixes match names rather than the SAP package hierarchy. |

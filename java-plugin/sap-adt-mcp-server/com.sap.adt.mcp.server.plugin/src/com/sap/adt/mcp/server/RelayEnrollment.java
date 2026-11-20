@@ -8,12 +8,9 @@ import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.security.SecureRandom;
-import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.Arrays;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Flow;
@@ -24,29 +21,41 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
 import com.google.gson.Strictness;
 
+/**
+ * Enrolls this Eclipse with the relay from an {@code sap-adt://enroll} link (role eclipse). The
+ * claim pins the relay CA during the TLS handshake, before the secret is sent.
+ */
 public final class RelayEnrollment {
+    public static final String PIN_MISMATCH = "The relay did not present the CA this link belongs to. "
+            + "This is either the wrong relay or an attacker in the middle.";
+    public static final String CLAIM_REFUSED = "The link was invalid, expired, cancelled or already used. "
+            + "Ask the relay operator for a new link.";
     private static final int MAX_BYTES = 64 * 1024;
-    private static final String CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
     private static final Gson JSON = new GsonBuilder().setStrictness(Strictness.STRICT).create();
     private final URI registration;
     private final URI bridge;
-    private final String label;
-    private final String id;
+    private final RelayLink link;
 
-    public RelayEnrollment(String label, String registrationUrl, String bridgeUrl) {
-        this.registration = RelayIdentity.checkEndpoint(registrationUrl, "https", "");
-        this.bridge = RelayIdentity.checkEndpoint(bridgeUrl, "wss", "/bridge");
-        if (label.isBlank() || label.length() > 64 || !label.chars().allMatch(c -> c >= 32 && c <= 126)) {
-            throw new IllegalArgumentException("Invalid registration label.");
+    /**
+     * @param link an enrollment link for the {@code eclipse} role. The link is used as is; the
+     *             caller should {@link RelayLink#wipe() wipe} it after {@link #enroll()} returns.
+     * @throws IllegalArgumentException when the link is not an enrollment link for Eclipse
+     */
+    public RelayEnrollment(RelayLink link) {
+        if (link == null || link.kind() != RelayLink.Kind.ENROLL || link.role() != RelayLink.Role.ECLIPSE) {
+            throw new IllegalArgumentException("Use an enrollment link for the eclipse role.");
         }
-        this.label = label;
-        byte[] random = new byte[16];
-        new SecureRandom().nextBytes(random);
-        this.id = HexFormat.of().formatHex(random);
+        this.registration = RelayIdentity.checkEndpoint(link.registrationUrl(), "https", "");
+        this.bridge = RelayIdentity.checkEndpoint(link.bridgeUrl(), "wss", "/bridge");
+        this.link = link;
     }
 
-    public String requestId() {
-        return id;
+    /** The data (mTLS) bridge URL the profile will use: {@code wss://<s>/bridge}. */
+    public String bridgeUrl() { return bridge.toASCIIString(); }
+
+    /** The enrollment origin the claim goes to: {@code https://<e>}. */
+    public String registrationOrigin() {
+        return registration.getScheme() + "://" + registration.getRawAuthority();
     }
 
     /** All messages from this exception are generated locally and safe to display. */
@@ -58,59 +67,51 @@ public final class RelayEnrollment {
         }
     }
 
-    @FunctionalInterface
-    public interface TokenPrompt {
-        String read() throws InterruptedException;
-    }
-
-    public RelayIdentity enroll(TokenPrompt prompt) throws InterruptedException, Failure {
-        String stage = "Registration failed or timed out. Check the registration URL and operator approval.";
+    public RelayIdentity enroll() throws InterruptedException, Failure {
+        String stage = "Could not reach the relay's enrollment address. Check the link and your network.";
+        byte[] fingerprint = RelayLink.tokenFingerprint(new String(link.token()));
+        if (fingerprint == null) throw new Failure("The link's code is not valid.");
+        RelayIdentity.PinnedAuthority pinned = new RelayIdentity.PinnedAuthority(fingerprint);
+        char[] secret = link.token();
         try {
-            JsonObject request = new JsonObject();
-            request.addProperty("id", id);
-            request.addProperty("label", label);
-            request.addProperty("role", "eclipse");
-            Reply approval = post(RelayIdentity.registrationClient(), "/request", request, 190);
-            if (!id.equals(RelayIdentity.string(approval.json(), "id"))) {
-                throw new Failure("The approval does not match this registration request.");
-            }
-            String caPem = RelayIdentity.string(approval.json(), "ca_pem");
-            X509Certificate ca = RelayIdentity.authority(caPem);
-            byte[] fingerprint = RelayIdentity.fingerprint(ca);
-            if (!MessageDigest.isEqual(fingerprint, RelayIdentity.fingerprint(approval.peerCa()))) {
-                throw new Failure("The approval CA differs from the CA presented by the registration endpoint.");
-            }
-            String token = prompt.read();
-            if (token == null) throw new Failure("Registration canceled before claiming a certificate.");
-            if (!MessageDigest.isEqual(fingerprint, tokenFingerprint(token))) {
-                throw new Failure("The approval token identifies a different relay CA.");
-            }
             JsonObject claim = new JsonObject();
-            claim.addProperty("token", token);
-            stage = "Could not claim the approved certificate. Start a new registration.";
-            JsonObject bundle = post(RelayIdentity.httpClient(ca, null), "/claim", claim, 30).json();
+            claim.addProperty("token", new String(secret));
+            JsonObject bundle = post(RelayIdentity.registrationClient(pinned), "/claim", claim, 30);
             stage = "The relay returned an invalid credential bundle.";
-            X509Certificate issuedCa = RelayIdentity.authority(RelayIdentity.string(bundle, "ca_pem"));
+            String caPem = RelayIdentity.string(bundle, "ca_pem");
+            X509Certificate issuedCa = RelayIdentity.authority(caPem);
             if (!MessageDigest.isEqual(fingerprint, RelayIdentity.fingerprint(issuedCa))) {
                 throw new Failure("The claimed certificate bundle uses a different relay CA.");
             }
+            String certificate = RelayIdentity.string(bundle, "client_cert_pem");
             JsonObject profile = new JsonObject();
             profile.addProperty("ca_pem", caPem);
             profile.addProperty("bridge", bridge.toASCIIString());
-            profile.addProperty("label", label);
-            profile.addProperty("client_cert_pem", RelayIdentity.string(bundle, "client_cert_pem"));
+            profile.addProperty("label", RelayIdentity.certificateLabel(certificate));
+            profile.addProperty("client_cert_pem", certificate);
             profile.addProperty("client_key_pem", RelayIdentity.string(bundle, "client_key_pem"));
             return RelayIdentity.fromProfile(profile);
         } catch (InterruptedException | Failure e) {
             throw e;
         } catch (Exception e) {
+            if (pinned.mismatched() || causedByPinMismatch(e)) throw new Failure(PIN_MISMATCH);
             throw new Failure(stage);
+        } finally {
+            Arrays.fill(secret, '\0');
+            Arrays.fill(fingerprint, (byte) 0);
+            link.wipe(); // a link is single use; this enrollment cannot be run twice
         }
     }
 
-    private record Reply(JsonObject json, X509Certificate peerCa) {}
+    private static boolean causedByPinMismatch(Throwable failure) {
+        Throwable cause = failure;
+        for (int depth = 0; cause != null && depth < 16; depth++, cause = cause.getCause()) {
+            if (cause instanceof RelayIdentity.PinMismatch) return true;
+        }
+        return false;
+    }
 
-    private Reply post(HttpClient client, String path, JsonObject json, int seconds) throws Exception {
+    private JsonObject post(HttpClient client, String path, JsonObject json, int seconds) throws Exception {
         HttpRequest request = HttpRequest.newBuilder(registration.resolve(path))
                 .timeout(Duration.ofSeconds(seconds)).header("Content-Type", "application/json")
                 .header("Accept", "application/json").POST(HttpRequest.BodyPublishers.ofString(json.toString())).build();
@@ -122,83 +123,22 @@ public final class RelayEnrollment {
             exchange.cancel(true);
         }
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new Failure(refusal(path, response.statusCode(), response.body()));
+            throw new Failure(CLAIM_REFUSED);
         }
         byte[] bytes = response.body();
         try {
-            JsonObject parsed = JSON.fromJson(new String(bytes, StandardCharsets.UTF_8), JsonObject.class);
-            Certificate[] chain = response.sslSession().orElseThrow().getPeerCertificates();
-            return new Reply(parsed, (X509Certificate) chain[chain.length - 1]);
+            return JSON.fromJson(new String(bytes, StandardCharsets.UTF_8), JsonObject.class);
         } finally {
             Arrays.fill(bytes, (byte) 0);
         }
     }
 
-    /**
-     * Local wording for the relay's refusal codes (REFUSED_* in the relay's src/enrollment.rs).
-     * The relay's body text is only compared, never displayed.
-     */
-    static String refusal(String path, int status, byte[] body) {
-        String code = body == null ? "" : new String(body, StandardCharsets.US_ASCII).strip();
-        if (status == 403 && code.equals("registration-closed")) {
-            return "Registration is closed on the relay. Ask the operator to open registration "
-                    + "(O in the relay's Enrollment tab), then request registration again.";
-        }
-        if (status == 403 && code.equals("request-denied")) {
-            return "The operator denied this request, or closed registration while it waited. "
-                    + "Request registration again.";
-        }
-        return "The relay refused " + path + " (HTTP " + status + ").";
-    }
-
-    /** The GW1 payload holds a 32-byte secret followed by the SHA-256 digest of the CA DER. */
-    private static byte[] tokenFingerprint(String token) throws Failure {
-        if (token.length() > 1024 || !token.regionMatches(true, 0, "GW1", 0, 3)) {
-            throw new Failure("Enter a valid approval token.");
-        }
-        byte[] fingerprint = new byte[32];
-        int accumulator = 0;
-        int bits = 0;
-        int length = 0;
-        for (int i = 3; i < token.length(); i++) {
-            char symbol = token.charAt(i);
-            if (symbol == '-' || symbol == ' ' || symbol == '\t' || symbol == '\n' || symbol == '\r' || symbol == '\f') {
-                continue;
-            }
-            int value = switch (symbol) {
-                case 'O', 'o' -> 0;
-                case 'I', 'i', 'L', 'l' -> 1;
-                default -> symbol > 127 ? -1 : CROCKFORD.indexOf(Character.toUpperCase(symbol));
-            };
-            if (value < 0) {
-                throw new Failure("Enter a valid approval token.");
-            }
-            accumulator = (accumulator << 5) | value;
-            bits += 5;
-            if (bits >= 8) {
-                bits -= 8;
-                if (length >= 64) {
-                    throw new Failure("Enter a valid approval token.");
-                }
-                if (length >= 32) {
-                    fingerprint[length - 32] = (byte) (accumulator >> bits);
-                }
-                length++;
-            }
-        }
-        if (length != 64 || bits != 3 || (accumulator & 7) != 0) {
-            throw new Failure("Enter a valid approval token.");
-        }
-        return fingerprint;
-    }
-
+    /** Whether {@code token} is a well-formed {@code GW1-} token. */
     public static boolean validTokenFormat(String token) {
-        try {
-            tokenFingerprint(token.strip());
-            return true;
-        } catch (Failure e) {
-            return false;
-        }
+        byte[] fingerprint = RelayLink.tokenFingerprint(token.strip());
+        if (fingerprint == null) return false;
+        Arrays.fill(fingerprint, (byte) 0);
+        return true;
     }
 
     private static final class LimitedReply implements HttpResponse.BodySubscriber<byte[]> {

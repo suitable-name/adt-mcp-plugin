@@ -1,0 +1,367 @@
+{
+ "valid": [
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "kind": "enroll",
+   "role": "desktop",
+   "name": "Gussek Relay",
+   "server": "relay.example.org:8787",
+   "enrollment": "relay.example.org:8788",
+   "endpoint": null,
+   "label": null,
+   "token": "GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=eclipse&n=Gu%C3%9Fek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&l=Anna+Laptop&t=GW1-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G208-1060R-30C1G-60R30-C1G60-R30C1-G60R3-0C1G6-0R30C-1G60R-30C1G-60R",
+   "kind": "enroll",
+   "role": "eclipse",
+   "name": "Gußek Relay",
+   "server": "relay.example.org:8787",
+   "enrollment": "relay.example.org:8788",
+   "endpoint": null,
+   "label": "Anna Laptop",
+   "token": "GW1-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G208-1060R-30C1G-60R30-C1G60-R30C1-G60R3-0C1G6-0R30C-1G60R-30C1G-60R"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=[2001:db8::1]:8787&e=[::1]:8788&t=GW1-0C1G6-0R30C-1G60R-30C1G-60R30-C1G60-R30C1-G60R3-0C1G6-0R30C-1G810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G20-810",
+   "kind": "enroll",
+   "role": "desktop",
+   "name": "Gussek Relay",
+   "server": "[2001:db8::1]:8787",
+   "enrollment": "[::1]:8788",
+   "endpoint": null,
+   "label": null,
+   "token": "GW1-0C1G6-0R30C-1G60R-30C1G-60R30-C1G60-R30C1-G60R3-0C1G6-0R30C-1G810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G20-810"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=10.0.0.5:8787&e=10.0.0.5:8788&l=Plain&t=GW1-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20A18-50M2G-A1850-M2GA1-850M2-GA185-0M2GA-1850M-2GA18-50M2G-A18",
+   "kind": "enroll",
+   "role": "desktop",
+   "name": "Gussek Relay",
+   "server": "10.0.0.5:8787",
+   "enrollment": "10.0.0.5:8788",
+   "endpoint": null,
+   "label": "Plain",
+   "token": "GW1-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20A18-50M2G-A1850-M2GA1-850M2-GA185-0M2GA-1850M-2GA18-50M2G-A18"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=%5B%3A%3A1%5D%3A8787&e=localhost%3A8788&t=GW1-0M2GA-1850M-2GA18-50M2G-A1850-M2GA1-850M2-GA185-0M2GA-1850M-2GC1G-60R30-C1G60-R30C1-G60R3-0C1G6-0R30C-1G60R-30C1G-60R30-C1G",
+   "kind": "enroll",
+   "role": "desktop",
+   "name": "Gussek Relay",
+   "server": "[::1]:8787",
+   "enrollment": "localhost:8788",
+   "endpoint": null,
+   "label": null,
+   "token": "GW1-0M2GA-1850M-2GA18-50M2G-A1850-M2GA1-850M2-GA185-0M2GA-1850M-2GC1G-60R30-C1G60-R30C1-G60R3-0C1G6-0R30C-1G60R-30C1G-60R30-C1G"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-0R30C-1G60R-30C1G-60R30-C1G60-R30C1-G60R3-0C1G6-0R30C-1G60R-30E1R-70W3G-E1R70-W3GE1-R70W3-GE1R7-0W3GE-1R70W-3GE1R-70W3G-E1R",
+   "kind": "enroll",
+   "role": "desktop",
+   "name": "",
+   "server": "relay.example.org:8787",
+   "enrollment": "relay.example.org:8788",
+   "endpoint": null,
+   "label": null,
+   "token": "GW1-0R30C-1G60R-30C1G-60R30-C1G60-R30C1-G60R3-0C1G6-0R30C-1G60R-30E1R-70W3G-E1R70-W3GE1-R70W3-GE1R7-0W3GE-1R70W-3GE1R-70W3G-E1R"
+  },
+  {
+   "link": "  SAP-ADT://ENROLL?x=1&x=2&p=zz&p=yy&v=1&r=eclipse&n=A%2BB&s=h.example:1&e=h.example:65535&t=GW1-0W3GE-1R70W-3GE1R-70W3G-E1R70-W3GE1-R70W3-GE1R7-0W3GE-1R70W-3GG20-81040-G2081-040G2-08104-0G208-1040G-20810-40G20-81040-G20&future=1#ignored",
+   "kind": "enroll",
+   "role": "eclipse",
+   "name": "A+B",
+   "server": "h.example:1",
+   "enrollment": "h.example:65535",
+   "endpoint": null,
+   "label": null,
+   "token": "GW1-0W3GE-1R70W-3GE1R-70W3G-E1R70-W3GE1-R70W3-GE1R7-0W3GE-1R70W-3GG20-81040-G2081-040G2-08104-0G208-1040G-20810-40G20-81040-G20"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&s=relay.example.org:8787&e=relay.example.org:8788&l=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&t=GW1-1040G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40J28-9144G-J2891-44GJ2-89144-GJ289-144GJ-28914-4GJ28-9144G-J28",
+   "kind": "enroll",
+   "role": "desktop",
+   "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "server": "relay.example.org:8787",
+   "enrollment": "relay.example.org:8788",
+   "endpoint": null,
+   "label": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+   "token": "GW1-1040G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40J28-9144G-J2891-44GJ2-89144-GJ289-144GJ-28914-4GJ28-9144G-J28"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=abababababababababababababababababababababababababababababababab&n=Eclipse+Laptop&t=GW1-144GJ-28914-4GJ28-9144G-J2891-44GJ2-89144-GJ289-144GJ-28914-4GM2G-A1850-M2GA1-850M2-GA185-0M2GA-1850M-2GA18-50M2G-A1850-M2G",
+   "kind": "pair",
+   "role": null,
+   "name": "Eclipse Laptop",
+   "server": null,
+   "enrollment": null,
+   "endpoint": "abababababababababababababababababababababababababababababababab",
+   "label": null,
+   "token": "GW1-144GJ-28914-4GJ28-9144G-J2891-44GJ2-89144-GJ289-144GJ-28914-4GM2G-A1850-M2GA1-850M2-GA185-0M2GA-1850M-2GA18-50M2G-A1850-M2G"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&n=Z%C3%B6e+%26+Co&t=GW1-1850M-2GA18-50M2G-A1850-M2GA1-850M2-GA185-0M2GA-1850M-2GA18-50P2R-B1C5G-P2RB1-C5GP2-RB1C5-GP2RB-1C5GP-2RB1C-5GP2R-B1C5G-P2R",
+   "kind": "pair",
+   "role": null,
+   "name": "Zöe & Co",
+   "server": null,
+   "enrollment": null,
+   "endpoint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+   "label": null,
+   "token": "GW1-1850M-2GA18-50M2G-A1850-M2GA1-850M2-GA185-0M2GA-1850M-2GA18-50P2R-B1C5G-P2RB1-C5GP2-RB1C5-GP2RB-1C5GP-2RB1C-5GP2R-B1C5G-P2R"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=abababababababababababababababababababababababababababababababab&r=root&r=other&s=x&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "kind": "pair",
+   "role": null,
+   "name": "",
+   "server": null,
+   "enrollment": null,
+   "endpoint": "abababababababababababababababababababababababababababababababab",
+   "label": null,
+   "token": "GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G"
+  }
+ ],
+ "invalid": [
+  {
+   "link": "",
+   "error": "NotALink"
+  },
+  {
+   "link": "https://example.org/enroll",
+   "error": "NotALink"
+  },
+  {
+   "link": "sap-adt://other?v=1&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "NotALink"
+  },
+  {
+   "link": "sap-adt://pair",
+   "error": "NotALink"
+  },
+  {
+   "link": "sap-adt://enroll",
+   "error": "NotALink"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G&x=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "error": "TooLong"
+  },
+  {
+   "link": "sap-adt://enroll?v=2&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "NeedsNewerVersion"
+  },
+  {
+   "link": "sap-adt://enroll?v=99999999999&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "NeedsNewerVersion"
+  },
+  {
+   "link": "sap-adt://enroll?v=0&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "NeedsNewerVersion"
+  },
+  {
+   "link": "sap-adt://pair?v=2&p=abababababababababababababababababababababababababababababababab&n=Eclipse+Laptop&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "NeedsNewerVersion"
+  },
+  {
+   "link": "sap-adt://enroll?r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "MissingPart"
+  },
+  {
+   "link": "sap-adt://enroll?v=abc&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "MissingPart"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "MissingPart"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "MissingPart"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "MissingPart"
+  },
+  {
+   "link": "sap-adt://pair?v=1&n=Eclipse+Laptop&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "MissingPart"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G&v=1",
+   "error": "RepeatedPart"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G&s=other.example:1",
+   "error": "RepeatedPart"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "RepeatedPart"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=abababababababababababababababababababababababababababababababab&n=Eclipse+Laptop&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G&p=abababababababababababababababababababababababababababababababab",
+   "error": "RepeatedPart"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=root&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "UnknownRole"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=Desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "UnknownRole"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "UnknownRole"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=A%00B&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadName"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadName"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=%FF&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadName"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&l=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadName"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=abababababababababababababababababababababababababababababababab&n=x%0Ay&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadName"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadAddress"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=::1:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadAddress"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=999.1.1.1:80&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadAddress"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=-bad.example:80&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadAddress"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=[::1]&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadAddress"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=a..b:80&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadAddress"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=host:0&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadPort"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=host:65536&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadPort"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=host:abc&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadPort"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=host:&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadPort"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788",
+   "error": "MissingToken"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=abababababababababababababababababababababababababababababababab&n=Eclipse+Laptop",
+   "error": "MissingToken"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=XX1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadToken"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-",
+   "error": "BadToken"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-ABCD",
+   "error": "BadToken"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-401",
+   "error": "BadToken"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+   "error": "BadToken"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=abababababababababababababababababababababababababababababababab&n=Eclipse+Laptop&t=GW1-UUUU",
+   "error": "BadToken"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB&n=Eclipse+Laptop&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadEndpoint"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=abcd&n=Eclipse+Laptop&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadEndpoint"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=abababababababababababababababababababababababababababababababag&n=Eclipse+Laptop&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadEndpoint"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=A%zz&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadEncoding"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=A%2&s=relay.example.org:8787&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadEncoding"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&l=x%&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadEncoding"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=host%2G:80&e=relay.example.org:8788&t=GW1-040G2-08104-0G208-1040G-20810-40G20-81040-G2081-040G2-08104-0G40G-20810-40G20-81040-G2081-040G2-08104-0G208-1040G-20810-40G",
+   "error": "BadEncoding"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=root&n=A%00B&s=bad&e=relay.example.org:8788&t=nope",
+   "error": "UnknownRole"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=A%00B&s=bad&e=relay.example.org:8788",
+   "error": "BadName"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=host:0&e=bad",
+   "error": "BadPort"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=bad&l=%00",
+   "error": "BadAddress"
+  },
+  {
+   "link": "sap-adt://enroll?v=1&r=desktop&n=Gussek+Relay&s=relay.example.org:8787&e=relay.example.org:8788&l=%00",
+   "error": "BadName"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=bad&n=%00",
+   "error": "BadEndpoint"
+  },
+  {
+   "link": "sap-adt://pair?v=1&p=abababababababababababababababababababababababababababababababab&n=%00",
+   "error": "BadName"
+  }
+ ]
+}

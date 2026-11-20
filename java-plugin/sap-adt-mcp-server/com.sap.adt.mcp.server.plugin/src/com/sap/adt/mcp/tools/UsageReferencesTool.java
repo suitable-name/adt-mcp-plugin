@@ -17,6 +17,11 @@ public class UsageReferencesTool extends AbstractMcpTool {
     }
 
     @Override
+    public ToolClass toolClass() {
+        return ToolClass.READ;
+    }
+
+    @Override
     public String getName() {
         return NAME;
     }

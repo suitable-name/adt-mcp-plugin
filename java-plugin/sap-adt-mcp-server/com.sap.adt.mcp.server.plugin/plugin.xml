@@ -29,4 +29,19 @@
       <initializer class="com.sap.adt.mcp.preferences.PreferenceInitializer"/>
    </extension>
 
+   <!-- Preference pages: MCP Relay, Permissions -->
+   <extension point="org.eclipse.ui.preferencePages">
+      <page
+            id="com.sap.adt.mcp.preferences.root"
+            name="MCP Relay"
+            class="com.sap.adt.mcp.preferences.McpRelayPreferencePage">
+      </page>
+      <page
+            id="com.sap.adt.mcp.preferences.permissions"
+            category="com.sap.adt.mcp.preferences.root"
+            name="Permissions"
+            class="com.sap.adt.mcp.preferences.PermissionsPreferencePage">
+      </page>
+   </extension>
+
 </plugin>

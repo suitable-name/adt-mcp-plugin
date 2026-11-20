@@ -25,10 +25,12 @@ use zeroize::Zeroizing;
 
 use crate::{
     bridge::{BridgeRow, Registry},
-    enrollment::{ApplicantRow, Enrollment},
+    enrollment::{EnrolledRow, Enrollment, LinkRow},
+    link::Role,
     logs::Logs,
-    policy::PolicyStore,
+    policy::{E2eSettings, PolicyStore},
     security::{EnrolledClient, Pki},
+    tunnel::StreamRow,
 };
 use endpoints::EndpointEditor;
 use rules::Editor;
@@ -65,10 +67,54 @@ impl Tab {
     }
 }
 
+/// The "New link" dialog: a role and a label.
+struct LinkForm {
+    role: Role,
+    label: String,
+}
+
+enum FormAction {
+    Pending,
+    Cancel,
+    Create,
+}
+
+impl LinkForm {
+    const MAX_LABEL: usize = 64;
+
+    fn key(&mut self, key: KeyEvent) -> FormAction {
+        match key.code {
+            KeyCode::Esc => return FormAction::Cancel,
+            KeyCode::Enter if !self.label.trim().is_empty() => return FormAction::Create,
+            KeyCode::Left | KeyCode::Right => {
+                self.role = match self.role {
+                    Role::Desktop => Role::Eclipse,
+                    Role::Eclipse => Role::Desktop,
+                };
+            }
+            KeyCode::Backspace => {
+                self.label.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.label.clear();
+            }
+            KeyCode::Char(c)
+                if (c.is_ascii_graphic() || c == ' ')
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.label.len() < Self::MAX_LABEL =>
+            {
+                self.label.push(c);
+            }
+            _ => {}
+        }
+        FormAction::Pending
+    }
+}
+
 enum Dialog {
-    Request { row: ApplicantRow, approve: bool },
+    NewLink(LinkForm),
+    Link(Zeroizing<String>),
     Revoke(EnrolledClient),
-    Token(Zeroizing<String>),
     Rules(Editor),
     Endpoints(EndpointEditor),
 }
@@ -80,16 +126,21 @@ struct Ui {
     logs: Logs,
     tab: usize,
     selected: usize,
-    pending: Vec<ApplicantRow>,
-    open: bool,
-    /// Requests refused while registration was closed, and the latest peer.
-    refused: (u64, Option<std::net::SocketAddr>),
+    /// Outstanding enrollment links and the latest enrollments, refreshed with every frame.
+    links: Vec<LinkRow>,
+    enrolled: Vec<EnrolledRow>,
     clients: Vec<EnrolledClient>,
     registry: Registry,
     /// Live Eclipse bridges and desktop sessions, refreshed with every frame.
     connections: Vec<BridgeRow>,
+    /// Live end-to-end streams, refreshed with every frame.
+    streams: Vec<StreamRow>,
+    /// The end-to-end requirement (global and per endpoint), reloaded on refresh and after edits.
+    e2e: E2eSettings,
     /// First line shown on the Connections tab.
     connections_scroll: u16,
+    /// The next frame scrolls the Connections tab to keep the selected bridge visible.
+    connections_follow: bool,
     log_offset: usize,
     log_column: usize,
     dialog: Option<Dialog>,
@@ -98,20 +149,58 @@ struct Ui {
 
 impl Ui {
     fn refresh_pending(&mut self) {
-        (self.open, self.pending) = self.enrollment.snapshot();
-        self.refused = self.enrollment.closed_refusals();
+        (self.links, self.enrolled) = self.enrollment.snapshot();
         self.connections = self.registry.snapshot();
+        self.streams = self.registry.stream_snapshot();
+    }
+
+    /// Reload the end-to-end requirement from the policy file; keeps the old value on error.
+    fn reload_e2e(&mut self) {
+        if let Ok(document) = self.policy.snapshot() {
+            self.e2e = document.e2e();
+        }
     }
 
     /// Scroll the Connections tab; the renderer clamps the offset to its content.
-    fn scroll_connections(&mut self, key: KeyCode) {
+    const fn scroll_connections(&mut self, key: KeyCode) {
+        self.connections_follow = false;
         self.connections_scroll = match key {
-            KeyCode::Up => self.connections_scroll.saturating_sub(1),
-            KeyCode::Down => self.connections_scroll.saturating_add(1),
             KeyCode::PageUp => self.connections_scroll.saturating_sub(10),
             KeyCode::PageDown => self.connections_scroll.saturating_add(10),
             _ => 0,
         };
+    }
+
+    /// Move the selected bridge on the Connections tab and scroll it into view.
+    fn select_connection(&mut self, key: KeyCode) {
+        self.selected = if key == KeyCode::Up {
+            self.selected.saturating_sub(1)
+        } else {
+            (self.selected + 1).min(self.count().saturating_sub(1))
+        };
+        self.connections_follow = true;
+    }
+
+    /// Flip the end-to-end requirement of the selected Eclipse endpoint.
+    fn toggle_require(&mut self) -> Result<()> {
+        let Some(row) = self.connections.get(self.selected) else {
+            return Ok(());
+        };
+        let endpoint = row.endpoint.clone();
+        let required = self.policy.toggle_endpoint_e2e(&endpoint)?;
+        tracing::info!(
+            %endpoint,
+            required,
+            "Operator changed the end-to-end encryption requirement of an Eclipse endpoint."
+        );
+        self.reload_e2e();
+        self.status = if required {
+            "End-to-end encryption is now required for this endpoint. Unencrypted sessions end at their next request."
+        } else {
+            "Unencrypted desktop sessions are allowed for this endpoint."
+        }
+        .into();
+        Ok(())
     }
 
     /// The enrolled label for a certificate fingerprint, if it is still enrolled.
@@ -127,6 +216,7 @@ impl Ui {
         self.clients = self.pki.clients()?;
         self.clients
             .sort_by(|a, b| (&a.label, &a.fingerprint).cmp(&(&b.label, &b.fingerprint)));
+        self.reload_e2e();
         Ok(())
     }
 
@@ -138,10 +228,11 @@ impl Ui {
 
     fn count(&self) -> usize {
         match Tab::ALL[self.tab] {
-            Tab::Enrollment => self.pending.len(),
+            Tab::Enrollment => self.links.len(),
             Tab::Clients => self.clients.len(),
             Tab::Rules => 1 + self.desktops().count(),
-            Tab::Connections | Tab::Logs => 0,
+            Tab::Connections => self.connections.len(),
+            Tab::Logs => 0,
         }
     }
 
@@ -190,32 +281,33 @@ impl Ui {
             KeyCode::Left if tab == Tab::Logs => {
                 self.log_column = self.log_column.saturating_sub(8);
             }
-            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home
-                if tab == Tab::Connections =>
-            {
+            KeyCode::Up | KeyCode::Down if tab == Tab::Connections => {
+                self.select_connection(key.code);
+            }
+            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home if tab == Tab::Connections => {
                 self.scroll_connections(key.code);
             }
+            KeyCode::Char('e') if tab == Tab::Connections => self.toggle_require()?,
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => {
                 self.selected = (self.selected + 1).min(self.count().saturating_sub(1));
             }
-            KeyCode::Char('o') if tab == Tab::Enrollment => {
-                self.enrollment.set_open(!self.open);
-                self.refresh_pending();
-                self.status = if self.open {
-                    "Enrollment opened."
-                } else {
-                    "Enrollment closed. Pending requests and tokens were discarded."
-                }
-                .into();
+            KeyCode::Char('n') if tab == Tab::Enrollment => {
+                self.dialog = Some(Dialog::NewLink(LinkForm {
+                    role: Role::Desktop,
+                    label: String::new(),
+                }));
+                self.status.clear();
             }
-            KeyCode::Char('a' | 'd') if tab == Tab::Enrollment => {
-                if let Some(row) = self.pending.get(self.selected) {
-                    self.dialog = Some(Dialog::Request {
-                        row: row.clone(),
-                        approve: key.code == KeyCode::Char('a'),
-                    });
-                    self.status.clear();
+            KeyCode::Char('x') if tab == Tab::Enrollment => {
+                if let Some(row) = self.links.get(self.selected) {
+                    self.status = if self.enrollment.cancel(row.number) {
+                        "Link cancelled."
+                    } else {
+                        "The link was already used or expired."
+                    }
+                    .into();
+                    self.refresh_pending();
                 }
             }
             KeyCode::Char('r') if tab == Tab::Clients => {
@@ -268,30 +360,39 @@ impl Ui {
             Dialog::Rules(mut editor) => {
                 let result = editor.key(key, &self.policy);
                 match result {
-                    Ok(Some(status)) => self.status = status.into(),
+                    Ok(Some(status)) => {
+                        self.status = status.into();
+                        self.reload_e2e();
+                    }
                     other => {
                         self.dialog = Some(Dialog::Rules(editor));
                         let _ = other?;
                     }
                 }
             }
+            Dialog::NewLink(mut form) => match form.key(key) {
+                FormAction::Cancel => self.status.clear(),
+                FormAction::Pending => self.dialog = Some(Dialog::NewLink(form)),
+                FormAction::Create => {
+                    match self.enrollment.new_link(form.role, form.label.trim()) {
+                        Ok(link) => self.dialog = Some(Dialog::Link(link)),
+                        Err(error) => {
+                            self.dialog = Some(Dialog::NewLink(form));
+                            return Err(error.into());
+                        }
+                    }
+                }
+            },
+            // Closing the dialog drops (and wipes) the link: it is not shown again.
             _ if key.code == KeyCode::Esc => self.status.clear(),
-            Dialog::Token(token) if key.code == KeyCode::Char('c') => {
+            Dialog::Link(link) if key.code == KeyCode::Char('c') => {
                 // Clipboard writes are explicit. Keep this escape sequence out of all log writers.
-                let encoded = Zeroizing::new(STANDARD.encode(token.as_bytes()));
-                self.dialog = Some(Dialog::Token(token));
+                let encoded = Zeroizing::new(STANDARD.encode(link.as_bytes()));
+                self.dialog = Some(Dialog::Link(link));
                 let mut output = io::stdout().lock();
                 write!(output, "\x1b]52;c;{}\x07", encoded.as_str())?;
                 output.flush()?;
                 self.status = "Clipboard copy requested. Terminal support is required.".into();
-            }
-            Dialog::Request { row, approve } if key.code == KeyCode::Enter => {
-                if approve {
-                    self.dialog = Some(Dialog::Token(self.enrollment.approve(&row)?));
-                } else {
-                    self.enrollment.deny(&row)?;
-                    self.status = "Request denied.".into();
-                }
             }
             Dialog::Revoke(client) if key.code == KeyCode::Enter => {
                 self.pki.revoke(&client.role, &client.fingerprint)?;
@@ -315,12 +416,6 @@ impl Drop for StopOnDrop {
     }
 }
 
-impl Drop for Ui {
-    fn drop(&mut self) {
-        self.enrollment.set_open(false);
-    }
-}
-
 impl Drop for Screen {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
@@ -337,6 +432,7 @@ fn interact(ui: &mut Ui, stop: &AtomicBool) -> Result<()> {
     let _screen = Screen;
     execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    ui.reload_e2e();
     while !stop.load(Ordering::Acquire) {
         ui.refresh_pending();
         ui.selected = ui.selected.min(ui.count().saturating_sub(1));
@@ -382,13 +478,15 @@ pub async fn run(
             logs,
             tab: 0,
             selected: 0,
-            pending: Vec::new(),
-            open: false,
-            refused: (0, None),
+            links: Vec::new(),
+            enrolled: Vec::new(),
             clients: Vec::new(),
             registry,
             connections: Vec::new(),
+            streams: Vec::new(),
+            e2e: E2eSettings::default(),
             connections_scroll: 0,
+            connections_follow: false,
             log_offset: 0,
             log_column: 0,
             dialog: None,

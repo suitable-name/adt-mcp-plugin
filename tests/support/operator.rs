@@ -18,7 +18,8 @@ impl Operator {
     pub fn start(binary: &str, pki: &Path) -> Result<Self> {
         let size = PtySize {
             rows: 48,
-            cols: 160,
+            // Wide enough to show a whole link on one row.
+            cols: 320,
             pixel_width: 0,
             pixel_height: 0,
         };
@@ -67,35 +68,56 @@ impl Operator {
             .await
     }
 
-    pub async fn approve(&self, id: &str) -> Result<String> {
-        self.wait_for("the pending enrollment request", |s| s.contains(id))
-            .await?;
-        self.keys(b"a")?;
-        self.wait_for("the approval dialog for the selected request", |s| {
-            s.contains("Approve Enrollment") && s.contains(id)
+    /// Press N on the Enrollment tab, choose the role, type the label and read the link
+    /// from the screen. The dialog is dismissed again and the test checks that the link
+    /// is gone from the screen.
+    pub async fn new_link(&self, eclipse: bool, label: &str) -> Result<String> {
+        self.keys(b"n")?;
+        self.wait_for("the New Enrollment Link dialog", |s| {
+            s.contains("New Enrollment Link")
         })
         .await?;
+        if eclipse {
+            self.keys(b"\x1b[C")?;
+            self.wait_for("the eclipse role", |s| s.contains("\u{25c0} eclipse"))
+                .await?;
+        }
+        self.keys(label.as_bytes())?;
+        self.wait_for("the typed label", |s| s.contains(label))
+            .await?;
         self.keys(b"\r")?;
         let screen = self
-            .wait_for("the complete enrollment token", |s| token(s).is_some())
+            .wait_for("the complete enrollment link", |s| link(s).is_some())
             .await?;
-        let grant = token(&screen)
-            .context("Missing token from the local terminal.")?
+        let text = link(&screen)
+            .context("Missing link from the local terminal.")?
             .to_owned();
         self.keys(b"\x1b")?;
-        self.wait_for("dismissal of the enrollment token", |s| !s.contains("GW1-"))
-            .await?;
-        Ok(grant)
+        self.wait_for("dismissal of the enrollment link", |s| {
+            !s.contains("sap-adt://")
+        })
+        .await?;
+        Ok(text)
+    }
+
+    /// Cancel the selected (first) outstanding link with X.
+    pub async fn cancel_first_link(&self) -> Result<()> {
+        self.keys(b"x")?;
+        self.visible("Link cancelled.").await?;
+        Ok(())
     }
 }
 
-fn token(screen: &str) -> Option<&str> {
-    let start = screen.find("GW1-")?;
-    let grant = screen.get(start..start + 127)?;
-    grant
-        .bytes()
-        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
-        .then_some(grant)
+/// The link on the screen once all of its token is there.
+fn link(screen: &str) -> Option<&str> {
+    let start = screen.find("sap-adt://enroll?")?;
+    let text = screen[start..].split_whitespace().next()?;
+    let (_, token) = text.split_once("&t=")?;
+    (token.len() == 127
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-'))
+    .then_some(text)
 }
 
 impl Drop for Operator {

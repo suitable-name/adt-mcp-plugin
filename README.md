@@ -1,6 +1,6 @@
 # SAP ADT MCP Relay
 
-A desktop MCP host launches `sap-adt-mcp-client` over stdio. The client connects to the Rust relay using its enrolled certificate. Eclipse opens an outbound WebSocket to the same relay using a separately enrolled Eclipse certificate. SAP access uses the selected Eclipse ADT project's connection and authentication. The relay sees the tool arguments and results.
+A desktop MCP host launches `sap-adt-mcp-client` over stdio. The client connects to the Rust relay using its enrolled certificate. Eclipse opens an outbound WebSocket to the same relay using a separately enrolled Eclipse certificate. SAP access uses the selected Eclipse ADT project's connection and authentication. For a desktop that is not paired with its Eclipse, the relay sees the tool arguments and results; for a paired desktop it sees only metadata and the tool name. See the [security model](docs/security-model.md).
 
 One relay can serve multiple Eclipse workspaces. Each user enrolls a desktop profile, and the operator assigns that profile the Eclipse endpoints it may use. New desktops have no endpoint grants and default to read-only tool access. Each call runs under the SAP account connected in the selected workspace, subject to the relay's action and package rules.
 
@@ -42,24 +42,16 @@ Run these commands on the company server. Choose a fresh PKI directory under a t
 .\target\debug\sap-adt-mcp-server-relay.exe serve --pki C:\Relay\pki --listen 0.0.0.0:8787 --enrollment-listen 0.0.0.0:8788
 ```
 
-This opens the operator TUI with registration closed. Add `--issue-token` to start with registration open. The operator can toggle registration in the TUI in either case. Each requester still needs individual approval.
+This opens the operator TUI. The enrollment listener always runs; it accepts a claim only for a link the operator minted. Links name the relay by its DNS name from the PKI and the bound ports. Behind a gateway or NAT, set the addresses clients must use with `--public-data <host:port>` and `--public-enrollment <host:port>`, and the relay's display name with `--name <text>`.
 
-For unattended operation, use `serve --pki C:\Relay\pki --headless`. The server uses saved identities and policies, writes logs to stderr, and leaves the enrollment socket unbound.
+For unattended operation, use `serve --pki C:\Relay\pki --headless`. The server uses saved identities and policies and writes logs to stderr. Mint enrollment links on that machine with `issue-link` (see below). [Operator manual](docs/operator-manual.md)
 
-For enrollment from a line-oriented operator console, run this command in an attached terminal.
-
-```powershell
-.\sap-adt-mcp-server-relay.exe serve --pki C:\Relay\pki --headless --issue-token
-```
-
-Registration starts open. Compare the full request ID, role, and label with the requester. Enter `approve <number>` or `deny <number>` using the number on the matching console row. That command applies immediately. Approval displays the single-use token directly on the attached terminal. Stdout and stderr can both be redirected. Logs still use stderr. Startup fails if the process cannot open the operator terminal. [Operator manual](docs/operator-manual.md)
-
-Keep the PKI directory across restarts. Restrict it and its backups to the service account. It holds the CA signing key, server key, enrolled certificate fingerprints, and access policies. The server generates client credentials only when an approved token is claimed.
+Keep the PKI directory across restarts. Restrict it and its backups to the service account. It holds the CA signing key, server key, enrolled certificate fingerprints, access policies and `issue.secret` (the operator secret `issue-link` presents). The server generates client credentials only when a link is claimed.
 
 | Port | Purpose | Authentication |
 | --- | --- | --- |
 | 8787 | Desktop MCP requests on `/mcp` and Eclipse WebSocket upgrades on `/bridge` | TLS 1.3 with a client certificate and the matching role fingerprint |
-| 8788 | Enrollment requests and single-use claims | TLS 1.3, local operator approval, then a CA-pinned claim |
+| 8788 | Single-use claims (`/claim`) and link minting (`/issue`, loopback only) | TLS 1.3; a claim needs a minted, unexpired link whose token pins the CA; `/issue` needs the operator secret |
 
 Allow the workstations to reach both ports. For a corporate gateway, use TCP/TLS passthrough to the same relay instance. The relay must see the actual client certificate. The earlier setup that terminated TLS at an HTTP reverse proxy and forwarded bearer headers is incompatible. Choose a gateway timeout longer than ten minutes for long-running SAP calls and keep the Eclipse connection open for WebSocket traffic.
 
@@ -67,26 +59,42 @@ Allow the workstations to reach both ports. For a corporate gateway, use TCP/TLS
 
 Repeat this process once for each Eclipse workspace and desktop client profile. A fresh client needs the company server address. It receives its CA and private identity during enrollment.
 
-1. In the server's **Enrollment** tab, open registration. While open, the server accepts requests from any reachable network address.
-2. On the **requesting workstation**, enter a descriptive label and start enrollment. The client generates a random request ID and displays it locally. Only the public request ID, role, and label are sent at this stage. Use a label suitable for disclosure during initial contact.
-3. On the **server**, compare the request’s full ID, role, and label with the requester through a trusted channel. Approve or deny the request in the TUI or the headless approval console. On approval, give the displayed one-time `GW1-` token to the verified requester over the trusted channel.
-4. On the **workstation**, enter the token when prompted. The client checks the public CA against the fingerprint inside the token, then opens a fresh TLS connection that verifies the server hostname and that CA before sending the claim. The server consumes the token, issues a role-specific identity, and records its leaf fingerprint. The client saves its private profile. A pending request and an approved token each have their own three-minute lifetime.
-5. Close registration in **Enrollment** after both identities have been claimed. Closing discards outstanding requests and grants. Existing enrolled clients can connect while registration is closed.
+1. **The operator mints a link.** In the server's **Enrollment** tab press **N**, choose the role (`desktop` or `eclipse`) and type a label, then press **Enter**. The relay shows a link such as `sap-adt://enroll?v=1&r=desktop&n=Company+Relay&s=adt-relay.company.example:8787&e=adt-relay.company.example:8788&t=GW1-...` with **C Copy** (terminal clipboard). Headless, run `sap-adt-mcp-server-relay issue-link --pki C:\Relay\pki --role desktop --label "Anna desktop"` on the relay's machine (`--relay <host:port>` names the enrollment listener, default `127.0.0.1:8788`); it prints only the link on standard output. Minting the link is the approval.
+2. **The operator gives the link to the person.** The link is a password until it is used: single use, valid for 10 minutes, at most 16 outstanding. Cancel an unused link with **X** in the Enrollment tab. The link is shown once and hidden again when the dialog closes.
+3. **The workstation claims it.** The client reads the relay's addresses from the link, checks that the CA the relay presents matches the fingerprint inside the link's token (and stops with "wrong relay or attacker in the middle" otherwise) and only then sends the secret over that CA-pinned TLS connection. The relay consumes the link, issues the identity for the link's role and label, and answers any wrong, used, expired or cancelled link with one generic refusal. The client saves its private profile.
+4. The Enrollment tab and the log show "Anna desktop (desktop) enrolled from 203.0.113.7". A newly enrolled desktop is read-only and has no endpoint grants until the operator assigns them.
 
-The token follows the `diagram_loader` GW1 format, which combines a random 256-bit secret with the SHA-256 fingerprint of the CA. The initial TLS handshake presents public certificates. Client identity is established only after approval and the pinned claim. No client certificate, shared password, or CA file needs to be provisioned on a new workstation in advance.
+The token follows the `diagram_loader` GW1 format, which combines a random 256-bit secret with the SHA-256 fingerprint of the CA. No client certificate, shared password, or CA file needs to be provisioned on a new workstation in advance. Links are only pasted; the `sap-adt://` scheme is not registered with the operating system. Do not send a link through a channel the relay itself carries.
 
 ### Eclipse
 
-Open **Window → Show View → Other → SAP ADT MCP → SAP ADT Relay**. Register the workspace using `https://adt-relay.company.example:8788` for enrollment and `wss://adt-relay.company.example:8787/bridge` for the bridge. Complete the approval flow above. Click **Select ABAP Project** and choose the intended existing ADT workspace project in the Eclipse selector. The plugin uses that project's existing connection; ADT opens its normal login dialog if authentication is needed. Click **Connect Relay**. SAP connection settings and authentication are managed by ADT. The relay profile supplies trust for the relay connection.
+Open **Window → Show View → Other → SAP ADT MCP → SAP ADT Relay**. Register the workspace by pasting an **Eclipse** enrollment link (role `eclipse`) from the operator; the enrollment and bridge addresses come from the link. Click **Select ABAP Project** and choose the intended existing ADT workspace project in the Eclipse selector. The plugin uses that project's existing connection; ADT opens its normal login dialog if authentication is needed. Click **Connect Relay**. SAP connection settings and authentication are managed by ADT. The relay profile supplies trust for the relay connection.
 
 The bridge stays bound to the explicitly selected project when you switch editor tabs or Project Explorer selections. Disconnect the relay before selecting another project, then reconnect the desktop MCP host. Disconnecting the relay or closing its view releases the plugin's session while preserving the shared ADT login. A normal reconnect uses the selected project. If the project closes, loses authentication, or changes its destination identity, the plugin clears the selection; explicitly select the intended project again and reconnect.
 
+To let a desktop use this Eclipse over an end-to-end encrypted stream, connect the relay and click **Pair Desktop**. Copy the one-time link (valid 5 minutes, one outstanding) on this machine and paste it into the desktop client's `pair` command. Eclipse then asks **Pair <label>?** with the desktop key's short fingerprint; compare it with the one the client printed and click **Pair**. The view lists paired desktops with **Remove**, and **Preferences → MCP Relay → Permissions** can restrict each paired desktop further than the global permissions. [Pairing and per-desktop permissions](docs/operator-manual.md#pairing-desktops-encrypted-streams)
+
+#### Eclipse setup in order
+
+1. **Enroll** with the operator's Eclipse link (**Register Eclipse**), select the ABAP project and click **Connect Relay**.
+2. **Pair Desktop** for every desktop that should use this Eclipse, as described above.
+3. **Optionally turn off unencrypted calls.** Open **Preferences → MCP Relay → Permissions** and clear **Allow unencrypted relay calls**. This Eclipse then answers only encrypted requests from paired desktops, and refuses the relay's clear-text `tools/list` and `tools/call` with error `-32002`. The setting applies to the next call without a restart. The default in this version is on, so existing desktops keep working until they are paired. The encryption protections against a compromised relay hold only once this is off and the desktops are paired.
+
+An administrator can preset the switch for all users in `plugin_customization.ini` and lock it together with the permissions (the value then comes from the administrator layers only):
+
+```properties
+com.sap.adt.mcp.server.plugin/relay.allowUnencrypted=false
+com.sap.adt.mcp.server.plugin/permissions.locked=true
+```
+
+The MCP view shows "Unencrypted relay calls: allowed" or "blocked" next to the local-permissions line and logs each refused clear-text call. Threat model, what the relay still sees, key storage, revocation and the migration steps are in the [security model](docs/security-model.md).
+
 ### Desktop Client
 
-Place the portable client binary where the MCP host can execute it. It uses stdin and stdout and opens an outbound TLS connection. Run enrollment interactively once using the same OS account that will run the desktop host. Choose a **new** profile directory inside an existing private parent.
+Place the portable client binary where the MCP host can execute it. It uses stdin and stdout and opens an outbound TLS connection. Run enrollment once using the same OS account that will run the desktop host. Choose a **new** profile directory inside an existing private parent. Paste the **desktop** link from the operator. The link is a secret, so avoid shell histories you do not control.
 
 ```powershell
-& 'C:\Tools\sap-adt-mcp-client.exe' enroll --server https://adt-relay.company.example:8787 --enrollment https://adt-relay.company.example:8788 --label 'Anna desktop' --profile "$env:LOCALAPPDATA\sap-adt-profile"
+& 'C:\Tools\sap-adt-mcp-client.exe' enroll --link 'sap-adt://enroll?v=1&r=desktop&...' --profile "$env:LOCALAPPDATA\sap-adt-profile"
 ```
 
 In the server's **Access Rules** tab, highlight the enrolled desktop, press **E**, mark the allowed Eclipse workspaces with **Space**, then press **S** to save. On the workstation, list the available endpoints and save the ID of the intended workspace.
@@ -100,6 +108,24 @@ $endpoint = Read-Host 'Paste the endpoint ID'
 ```
 
 An exact, unique endpoint label such as `--set-endpoint=DEV` also works. The MCP host starts `connect --profile <absolute-directory>`. It reports setup instructions during initialization if the enrollment or selection is missing. After changing the selection, reconnect the MCP host. Ask the model “Which SAP endpoint am I using, and which others can I access?” It can call `relay_list_endpoints` to report the current ID and the workspaces granted to this profile.
+
+#### Pair the Desktop with Eclipse (end-to-end encryption)
+
+An endpoint that is not paired is served through the relay's `/mcp` path, and the relay can read its traffic. `connect` prints one warning on stderr for such an endpoint. Pairing makes the desktop and the Eclipse plugin talk through an inner TLS 1.3 session whose keys only the two ends know. The relay then forwards ciphertext plus a small readable envelope (method, tool name and action class) and still enforces its access rules on that envelope.
+
+1. The operator must already have granted the endpoint to this desktop (**Access Rules**, **E**).
+2. In Eclipse, open the MCP view and choose **Pair Desktop**. Copy the `sap-adt://pair?...` link. It works once, for five minutes, and is a secret. Copy it on this machine and never send it through the relay.
+3. On the desktop, run the following with the enrolled profile.
+
+```powershell
+& 'C:\Tools\sap-adt-mcp-client.exe' pair --profile "$env:LOCALAPPDATA\sap-adt-profile" --link 'sap-adt://pair?v=1&p=...'
+```
+
+The client checks Eclipse's key against the fingerprint in the link before it sends anything. A different key stops with “wrong Eclipse or attacker in the middle”. While it waits, it prints this desktop's short key fingerprint. Eclipse shows a **Pair <label>?** dialog with the same fingerprint; compare them and confirm. On success the Eclipse key is pinned in `peers.json` in the profile and this endpoint becomes the selected one. A wrong, expired or used link, or a refusal in Eclipse, prints “The link was wrong, expired, already used, or the pairing was refused in Eclipse.”
+
+The profile gains `inner_key.pem` (this desktop's P-256 identity key), `inner_cert.pem` and `peers.json`. Keep them as private as `credentials.json`. `unpair --profile <dir> --endpoint <id-or-label>` removes the pin; remove the desktop in Eclipse's MCP view as well.
+
+**No downgrade once paired.** While `peers.json` pins the selected endpoint, `connect` uses only the end-to-end path and never `/mcp`, whatever the relay answers. If the tunnel or the encrypted session fails, the request fails. A damaged `peers.json` stops the connection instead of reading as “unpaired”. To go back to the relay-readable path, run `unpair`.
 
 **Upgrading an existing relay:** enrollment certificates remain usable. Assign endpoint grants and set a selection on every desktop profile before reconnecting. Each separately enrolled device needs its own grants.
 
@@ -139,7 +165,7 @@ Within a package list, any matching pattern is enough. When the global and deskt
 
 ## Operations and Verification
 
-Use **Clients** to inspect or revoke an enrolled fingerprint. After credential loss or expiry, revoke the old fingerprint and enroll a fresh profile. Use **Logs** for recent relay events. In headless mode, direct stderr to the service's log collector. Set `RUST_LOG` to a level such as `info` or `debug` when starting the server. Enrollment tokens, tool arguments, and source code are excluded from relay logs.
+Use **Clients** to inspect or revoke an enrolled fingerprint. After credential loss or expiry, revoke the old fingerprint and enroll a fresh profile. Use **Logs** for recent relay events. In headless mode, direct stderr to the service's log collector. Set `RUST_LOG` to a level such as `info` or `debug` when starting the server. Enrollment links and tokens, tool arguments, and source code are excluded from relay logs.
 
 Client certificates are issued for one year and the server leaf for 825 days. Before the server leaf expires, run the following command with the service account and restart the relay. This uses the existing CA and preserves enrolled profiles. Replacing the CA requires a new PKI and fresh enrollment for every identity.
 
@@ -151,7 +177,7 @@ Connect the selected Eclipse workspace before initializing the desktop MCP sessi
 
 For the owner-run acceptance check:
 
-1. Verify startup with registration closed, open it in the TUI, deny one request, then enroll one desktop and one Eclipse identity. Check both forms of `--issue-token`, including human approval with redirected logs in headless mode.
+1. Verify startup, mint a desktop link and an Eclipse link in the TUI, and enroll one desktop and one Eclipse identity. Check that a used, cancelled or expired link is refused and that a link pointing at another relay fails the CA pin. In headless mode, mint a link with `issue-link` and enroll with it.
 2. Connect both clients. Compare a known source object with Eclipse. Verify a read-only user cannot discover or directly call `sap_set_source`.
 3. Change the desktop policy live. Allow a development package and verify both an allowed object and a known object in another package. Try search, a direct source request, and a source write against designated development fixtures. Disable activation and verify source writes are denied immediately.
 4. Restart in headless mode, reconnect both clients, and verify saved restrictions and logs. Return to the TUI and revoke the desktop fingerprint. Its next call must fail.

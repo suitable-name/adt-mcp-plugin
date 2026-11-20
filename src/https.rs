@@ -17,7 +17,7 @@
 //! - The 10 s connect timeout covers TCP and the TLS handshake (a connector wrapper bounds
 //!   `connect`/`connect_to`); the request timeout covers everything up to the end of the body.
 //!
-//! Included with `#[path]`; the including crate root must also include `src/rt.rs` as `mod rt`.
+//! Part of the shared library, next to [`crate::rt`].
 
 use std::{
     future::{Future, IntoFuture},

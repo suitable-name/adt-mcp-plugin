@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, PublicKeyData, SerialNumber,
@@ -19,8 +19,7 @@ use std::{
 use time::{Duration, OffsetDateTime};
 use zeroize::Zeroizing;
 
-pub mod storage;
-pub mod token;
+pub use sap_adt_mcp_server_relay::{storage, token};
 
 pub struct Pki {
     dir: PathBuf,
@@ -29,7 +28,12 @@ pub struct Pki {
     ca_pem: String,
     server_cert: CertificateDer<'static>,
     server_key: PrivateKeyDer<'static>,
+    /// The DNS name or IP address the server certificate was issued for.
+    dns: String,
 }
+
+/// File in the PKI directory with the operator secret for `POST /issue`.
+const ISSUE_SECRET_FILE: &str = "issue.secret";
 
 #[derive(Clone)]
 pub struct EnrolledClient {
@@ -180,6 +184,7 @@ impl Pki {
         for role in ["desktop", "eclipse"] {
             ensure!(dir.join(role).is_dir(), "Missing role directory: {role}.");
         }
+        let dns = certificate_name(&server_cert)?;
         Ok(Self {
             dir: dir.to_owned(),
             issuer,
@@ -187,7 +192,31 @@ impl Pki {
             ca_pem,
             server_cert,
             server_key,
+            dns,
         })
+    }
+
+    /// The name the server certificate was issued for.
+    pub(crate) fn dns_name(&self) -> &str {
+        &self.dns
+    }
+
+    /// Create a fresh operator secret (32 random bytes as hex) in `<pki>/issue.secret`,
+    /// replacing the one of an earlier run. The file is private to the owner like the CA key.
+    pub(crate) fn create_issue_secret(&self) -> Result<Zeroizing<String>> {
+        use ring::rand::{SecureRandom, SystemRandom};
+
+        let mut bytes = Zeroizing::new([0_u8; 32]);
+        SystemRandom::new()
+            .fill(bytes.as_mut_slice())
+            .map_err(|_| anyhow!("System randomness unavailable."))?;
+        let secret = Zeroizing::new(hex::encode(bytes.as_slice()));
+        let path = self.dir.join(ISSUE_SECRET_FILE);
+        storage::stage(&path, secret.as_bytes())?
+            .persist(&path)
+            .map_err(|error| error.error)
+            .context("Cannot write the operator secret.")?;
+        Ok(secret)
     }
 
     pub(crate) fn ca_pin(&self) -> [u8; 32] {
@@ -201,10 +230,6 @@ impl Pki {
             .persist(&path)
             .map_err(|error| error.error)?;
         Ok(())
-    }
-
-    pub(crate) const fn ca_pem(&self) -> &str {
-        self.ca_pem.as_str()
     }
 
     fn tls(&self, client_auth: bool) -> Result<ServerConfig> {
@@ -304,6 +329,46 @@ impl Pki {
             private_key: key.serialize_pem(),
         })
     }
+}
+
+/// The common name of a certificate, which for the server certificate is its DNS name.
+fn certificate_name(cert: &CertificateDer<'_>) -> Result<String> {
+    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
+        .map_err(|_| anyhow!("Cannot read the server certificate."))?;
+    parsed
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|field| field.as_str().ok())
+        .map(str::to_owned)
+        .context("The server certificate has no name.")
+}
+
+/// The CA certificate of a PKI directory (read-only access for `issue-link`).
+pub fn read_ca(dir: &Path) -> Result<CertificateDer<'static>> {
+    pem_cert(&fs::read_to_string(dir.join("ca.pem")).context("Cannot read the relay CA.")?)
+}
+
+/// The DNS name of the server certificate of a PKI directory.
+pub fn read_server_name(dir: &Path) -> Result<String> {
+    certificate_name(&pem_cert(
+        &fs::read_to_string(dir.join("server.pem"))
+            .context("Cannot read the server certificate.")?,
+    )?)
+}
+
+/// The operator secret the running relay created in `<pki>/issue.secret`.
+pub fn read_issue_secret(dir: &Path) -> Result<Zeroizing<String>> {
+    let text = Zeroizing::new(
+        fs::read_to_string(dir.join(ISSUE_SECRET_FILE))
+            .context("Cannot read issue.secret. Start the relay with this PKI directory first.")?,
+    );
+    let secret = text.trim();
+    ensure!(
+        secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()),
+        "issue.secret is malformed."
+    );
+    Ok(Zeroizing::new(secret.to_owned()))
 }
 
 fn enrolled_label(path: &Path) -> Result<Option<String>> {

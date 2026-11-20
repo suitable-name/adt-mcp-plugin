@@ -1,8 +1,7 @@
 //! smol runtime glue shared by the relay, the desktop client and the tests:
 //! a multi-threaded executor and timeouts.
 //!
-//! Included with `#[path]` by every crate root that needs it, so it must not
-//! depend on any other module of this package.
+//! Part of the shared library; it depends on no other module of this package.
 
 use std::{fmt, future::Future, sync::Once, time::Duration};
 

@@ -26,12 +26,15 @@ pub(super) struct Editor {
     target: Option<EnrolledClient>,
     revision: String,
     rules: Rules,
+    /// Global editor only: refuse unencrypted desktop sessions on every endpoint.
+    require_e2e: bool,
     page: Page,
 }
 
 impl Editor {
     pub(super) fn open(policy: &PolicyStore, target: Option<EnrolledClient>) -> Result<Self> {
         let doc = policy.snapshot()?;
+        let require_e2e = doc.require_e2e;
         let rules = match &target {
             Some(client) => doc
                 .desktops
@@ -44,8 +47,27 @@ impl Editor {
             target,
             revision: doc.revision,
             rules,
+            require_e2e,
             page: Page::Summary,
         })
+    }
+
+    fn save(&self, store: &PolicyStore) -> Result<()> {
+        if let Some(client) = &self.target {
+            store.set_desktop(
+                &self.revision,
+                &client.fingerprint,
+                Some(self.rules.clone()),
+            )?;
+        } else {
+            store.set_global_with_e2e(&self.revision, self.rules.clone(), self.require_e2e)?;
+            tracing::info!(
+                require_e2e = self.require_e2e,
+                "Operator saved the global end-to-end encryption requirement."
+            );
+        }
+        tracing::info!("Operator saved access rules.");
+        Ok(())
     }
 
     pub(super) fn key(
@@ -57,6 +79,9 @@ impl Editor {
             Page::Summary => match key.code {
                 KeyCode::Esc => return Ok(Some("Editor closed.")),
                 KeyCode::Char('r') => self.rules.read_only = !self.rules.read_only,
+                KeyCode::Char('e') if self.target.is_none() => {
+                    self.require_e2e = !self.require_e2e;
+                }
                 KeyCode::Char('a') => {
                     self.page = Page::Actions {
                         index: 0,
@@ -74,16 +99,7 @@ impl Editor {
                 KeyCode::Char('l') => *self = Self::open(store, self.target.clone())?,
                 KeyCode::Char('x') if self.target.is_some() => self.page = Page::Remove,
                 KeyCode::Char('s') => {
-                    if let Some(client) = &self.target {
-                        store.set_desktop(
-                            &self.revision,
-                            &client.fingerprint,
-                            Some(self.rules.clone()),
-                        )?;
-                    } else {
-                        store.set_global(&self.revision, self.rules.clone())?;
-                    }
-                    tracing::info!("Operator saved access rules.");
+                    self.save(store)?;
                     return Ok(Some("Access rules saved."));
                 }
                 _ => {}
@@ -158,8 +174,16 @@ impl Editor {
         let block = Block::bordered().title(title);
         match &self.page {
             Page::Summary => {
+                let encryption = if self.target.is_some() {
+                    String::new()
+                } else {
+                    format!(
+                        "Require end-to-end encryption    {}\n\n",
+                        if self.require_e2e { "On" } else { "Off" }
+                    )
+                };
                 let contents = format!(
-                    "Read-Only Mode    {}\n\nAllowed Actions\n{}\n\nAllowed Packages\n{}\n\n{}",
+                    "Read-Only Mode    {}\n\n{encryption}Allowed Actions\n{}\n\nAllowed Packages\n{}\n\n{}",
                     if self.rules.read_only { "On" } else { "Off" },
                     describe(self.rules.actions.as_deref()),
                     describe(self.rules.packages.as_deref()),
@@ -220,7 +244,7 @@ impl Editor {
                 "R Read-Only · A Actions · P Packages · S Save · L Reload · X Remove Override · Esc Cancel"
             }
             Page::Summary => {
-                "R Read-Only · A Actions · P Packages · S Save · L Reload · Esc Cancel"
+                "R Read-Only · E Require Encryption · A Actions · P Packages · S Save · L Reload · Esc Cancel"
             }
             Page::Actions { .. } => {
                 "↑/↓ Select · Space Toggle · * Allow All · 0 Clear · Enter Apply · Esc Cancel"

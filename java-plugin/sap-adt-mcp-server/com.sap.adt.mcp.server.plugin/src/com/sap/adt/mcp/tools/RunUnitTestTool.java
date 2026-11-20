@@ -18,6 +18,11 @@ public class RunUnitTestTool extends AbstractMcpTool {
     }
 
     @Override
+    public ToolClass toolClass() {
+        return ToolClass.EXECUTE;
+    }
+
+    @Override
     public String getName() {
         return NAME;
     }

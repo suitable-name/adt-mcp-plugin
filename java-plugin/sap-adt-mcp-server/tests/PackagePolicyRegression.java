@@ -24,11 +24,15 @@ public final class PackagePolicyRegression {
 
     public static void main(String[] args) {
         FakeSap sap = new FakeSap();
+        ToolCatalog catalog = loadCatalog();
+        // The local policy is unrestricted here, so this harness exercises the relay's package scopes only.
         RelayRequests relay = new RelayRequests(List.of(new SearchObjectTool(sap), new GetSourceTool(sap),
                 new ObjectStructureTool(sap), new LockTool(sap), new UnlockTool(sap), new SqlQueryTool(sap),
-                new SetSourceTool(sap), new CreateObjectTool(sap), new ActivateTool(sap)), sap);
-        JsonObject hello = json(relay.reply("{\"jsonrpc\":\"2.0\",\"method\":\"relay/hello\",\"id\":1}"));
-        check(hello.getAsJsonObject("result").get("policyVersion").getAsInt() == 1);
+                new SetSourceTool(sap), new CreateObjectTool(sap), new ActivateTool(sap)), sap, catalog,
+                LocalPolicy::unrestricted);
+        JsonObject hello = json(relay.reply(
+                "{\"jsonrpc\":\"2.0\",\"method\":\"relay/hello\",\"id\":1,\"params\":{\"policyVersion\":2}}"));
+        check(hello.getAsJsonObject("result").get("policyVersion").getAsInt() == 2);
         for (String invalid : new String[] {null, "null", "[\"/NS/*\"]", "[[\"Z*X\"]]", "[[\"/ns/*\"]]",
                 "[[\"*\"],[],[]]", "[[true]]", "[[]]"}) {
             check(call(relay, "sap_get_source", TARGET, invalid).has("error"));
@@ -97,12 +101,27 @@ public final class PackagePolicyRegression {
         params.addProperty("name", tool);
         params.add("arguments", json(args));
         if (layers != null) params.add("relayPackageScopes", JsonParser.parseString(layers));
+        // The relay allows every tool here; the package scopes are what these checks vary.
+        params.add("relayAllowedTools", JsonParser.parseString(
+                "[\"sap_activate\",\"sap_create_object\",\"sap_get_source\",\"sap_lock\",\"sap_object_structure\","
+                + "\"sap_search_object\",\"sap_set_source\",\"sap_sql_query\",\"sap_unlock\"]"));
         JsonObject request = new JsonObject();
         request.addProperty("id", 1);
         request.addProperty("jsonrpc", "2.0");
         request.addProperty("method", "tools/call");
         request.add("params", params);
         return json(relay.reply(request.toString()));
+    }
+
+    /** Loads the shared tool table from the source tree. Run the harness from the checkout root. */
+    private static ToolCatalog loadCatalog() {
+        String path = System.getProperty("tools.json",
+                "java-plugin/sap-adt-mcp-server/com.sap.adt.mcp.server.plugin/resources/tools.json");
+        try (java.io.Reader reader = java.nio.file.Files.newBufferedReader(java.nio.file.Path.of(path))) {
+            return ToolCatalog.load(reader);
+        } catch (java.io.IOException e) {
+            throw new AssertionError("Cannot read " + path, e);
+        }
     }
 
     private static JsonObject json(String value) { return JsonParser.parseString(value).getAsJsonObject(); }

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "tools": [
+    {"name": "sap_abap_docu", "class": "read", "packageAware": false, "components": []},
+    {"name": "sap_activate", "class": "write", "packageAware": true, "components": []},
+    {"name": "sap_atc_run", "class": "execute", "packageAware": false, "components": []},
+    {"name": "sap_create_object", "class": "write", "packageAware": true, "components": []},
+    {"name": "sap_get_source", "class": "read", "packageAware": true, "components": []},
+    {"name": "sap_inactive_objects", "class": "read", "packageAware": false, "components": []},
+    {"name": "sap_lock", "class": "write", "packageAware": true, "components": []},
+    {"name": "sap_object_structure", "class": "read", "packageAware": true, "components": []},
+    {"name": "sap_run_unit_test", "class": "execute", "packageAware": false, "components": []},
+    {"name": "sap_search_object", "class": "read", "packageAware": true, "components": []},
+    {"name": "sap_set_source", "class": "write", "packageAware": true, "components": ["sap_lock", "sap_unlock", "sap_activate"]},
+    {"name": "sap_sql_query", "class": "execute", "packageAware": false, "components": []},
+    {"name": "sap_syntax_check", "class": "execute", "packageAware": false, "components": []},
+    {"name": "sap_unlock", "class": "write", "packageAware": true, "components": []},
+    {"name": "sap_usage_references", "class": "read", "packageAware": false, "components": []}
+  ]
+}

@@ -14,28 +14,24 @@ use smol::{
 };
 use trillium_client::Status;
 
-use rt::timeout;
+use sap_adt_mcp_server_relay::{https, rt, rt::timeout};
 
-#[path = "../src/rt.rs"]
-mod rt;
-// https.rs is shared with the client binary; the tests use only a subset of it.
 #[path = "support/endpoints.rs"]
 mod endpoints;
-#[path = "../src/https.rs"]
-#[allow(dead_code)]
-mod https;
+#[path = "support/headless_issue.rs"]
+mod headless_issue;
 #[path = "support/operator.rs"]
 mod operator;
+#[path = "support/rogue.rs"]
+mod rogue;
 #[path = "support/terminal.rs"]
 mod terminal;
 use operator::Operator;
 
-#[cfg(any(unix, windows))]
-#[path = "support/headless_console.rs"]
-mod headless_console;
-
 const SERVER: &str = env!("CARGO_BIN_EXE_sap-adt-mcp-server-relay");
 const DESKTOP: &str = env!("CARGO_BIN_EXE_sap-adt-mcp-client");
+/// Link lifetime of the headless server (the relay only accepts a value below 10 minutes).
+const LINK_TTL_MS: u64 = 5000;
 type Logs = Lines<BufReader<ChildStderr>>;
 type Socket = WebSocketStream<TlsStream<TcpStream>>;
 
@@ -119,93 +115,32 @@ impl Registration {
         })
     }
 
-    async fn enroll_desktop(&self, profile: &Path, label: &str, wrong_ca: bool) -> Result<()> {
-        let mut child = process(DESKTOP)
-            .args([
-                "enroll",
-                "--server",
-                &format!("https://{}", self.data),
-                "--enrollment",
-                &format!("https://{}", self.enrollment),
-                "--label",
-                label,
-                "--profile",
-            ])
-            .arg(profile)
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let mut logs = BufReader::new(
-            child
-                .stderr
-                .take()
-                .context("Missing desktop enrollment log.")?,
-        )
-        .lines();
-        let client_id = matching_log(&mut logs, "Enrollment request ID: ").await?;
-        let id = client_id
-            .strip_prefix("Enrollment request ID: ")
-            .context("Missing desktop request ID.")?;
-        ensure!(id.len() == 32, "Invalid desktop request ID.");
-        let mut token = self.operator.approve(id).await?;
+    /// Enroll a desktop with a link the TUI minted, and expect success.
+    async fn enroll_desktop(&self, profile: &Path, label: &str) -> Result<()> {
+        let link = self.operator.new_link(false, label).await?;
+        let (ok, stderr) = enroll(&link, profile).await?;
         ensure!(
-            token.is_ascii() && token.len() > 100 && token.starts_with("GW1-"),
-            "Malformed operator token."
+            ok && stderr.contains("Client profile saved."),
+            "Desktop enrollment failed: {stderr}"
         );
-        if wrong_ca {
-            // Alter a fingerprint symbol after the secret and before the final padding.
-            let index = token[90..]
-                .bytes()
-                .position(|b| b != b'-')
-                .context("Missing fingerprint symbol.")?
-                + 90;
-            let replacement = if token.as_bytes()[index] == b'0' {
-                "1"
-            } else {
-                "0"
-            };
-            token.replace_range(index..=index, replacement);
-        }
-        input(
-            child
-                .stdin
-                .as_mut()
-                .context("Missing desktop token input.")?,
-            &token,
-        )
-        .await?;
-        if wrong_ca {
-            matching_log(&mut logs, "different CA").await?;
-            ensure!(
-                !child.status().await?.success() && !profile.exists(),
-                "Rejected identity was persisted."
-            );
-        } else {
-            matching_log(&mut logs, "Client profile saved.").await?;
-            ensure!(
-                child.status().await?.success(),
-                "Desktop enrollment failed."
-            );
-        }
+        // A link works once.
+        let again = profile.with_extension("again");
+        let (ok, stderr) = enroll(&link, &again).await?;
+        ensure!(
+            !ok && stderr.contains("already used, expired or cancelled") && !again.exists(),
+            "A link was accepted twice."
+        );
         Ok(())
     }
 
+    /// An Eclipse identity is claimed straight from the link's token, as the plugin does.
     async fn eclipse_identity(&self, http: &https::Client, label: &str) -> Result<Identity> {
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let body = json!({"id": id, "label": label, "role": "eclipse"});
-        let request = http
-            .post(format!("https://{}/request", self.enrollment))
-            .json(&body);
-        // The task is cancelled if dropped, so it stays bound until awaited.
-        let submit = rt::spawn(async move { request.send().await });
-        let token = self.operator.approve(&id).await?;
-        let approval: Value = submit.await?.error_for_status()?.json().await?;
-        assert_eq!(approval["id"], id);
-        ensure!(
-            approval["ca_pem"].is_string() && approval.get("token").is_none(),
-            "Invalid public approval."
-        );
-        let grant = json!({"token":token});
+        let link = self.operator.new_link(true, label).await?;
+        let token = link
+            .split_once("&t=")
+            .map(|(_, token)| token)
+            .context("The link has no token.")?;
+        let grant = json!({"token": token});
         let claim = format!("https://{}/claim", self.enrollment);
         let identity = http
             .post(&claim)
@@ -221,6 +156,74 @@ impl Registration {
         );
         Ok(identity)
     }
+
+    /// Links that must never enroll anyone: a cancelled one, a damaged one, and one that
+    /// points at a relay with another CA (the secret must not even be sent there).
+    async fn refused_links(&self, scratch: &Path) -> Result<()> {
+        let cancelled = self.operator.new_link(false, "Cancel Me").await?;
+        self.operator.cancel_first_link().await?;
+        let (ok, stderr) = enroll(&cancelled, &scratch.join("cancelled")).await?;
+        ensure!(
+            !ok && stderr.contains("already used, expired or cancelled")
+                && !scratch.join("cancelled").exists(),
+            "A cancelled link was accepted."
+        );
+        let (ok, stderr) = enroll(&cancelled.replace("v=1", "v=2"), &scratch.join("newer")).await?;
+        ensure!(
+            !ok && stderr.contains("newer version"),
+            "A link from the future was not diagnosed."
+        );
+        let (ok, stderr) = enroll(
+            &cancelled.replace("r=desktop", "r=eclipse"),
+            &scratch.join("wrong-role"),
+        )
+        .await?;
+        ensure!(
+            !ok && stderr.contains("Eclipse"),
+            "An Eclipse link enrolled a desktop."
+        );
+
+        let link = self.operator.new_link(false, "Pin Check").await?;
+        let (rogue, handshake) = rogue::start().await?;
+        let swapped = link.replace(&format!("&e={}&", self.enrollment), &format!("&e={rogue}&"));
+        ensure!(
+            swapped != link,
+            "The link did not name the enrollment address."
+        );
+        let (ok, stderr) = enroll(&swapped, &scratch.join("rogue")).await?;
+        ensure!(
+            !ok && stderr.contains("attacker in the middle") && !scratch.join("rogue").exists(),
+            "A relay with another CA was trusted: {stderr}"
+        );
+        ensure!(
+            !timeout(Duration::from_secs(15), handshake).await?,
+            "The client completed a handshake with a relay of another CA."
+        );
+        // The failed attempt did not use up the link.
+        let profile = scratch.join("pin-check");
+        let (ok, stderr) = enroll(&link, &profile).await?;
+        ensure!(
+            ok && stderr.contains("Client profile saved."),
+            "The pin check consumed the link: {stderr}"
+        );
+        Ok(())
+    }
+}
+
+/// Run `enroll --link`: whether it succeeded, and what it wrote to stderr (never the link).
+async fn enroll(link: &str, profile: &Path) -> Result<(bool, String)> {
+    let output = process(DESKTOP)
+        .args(["enroll", "--link", link, "--profile"])
+        .arg(profile)
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    ensure!(
+        !stderr.contains("GW1-") && !stderr.contains("sap-adt://"),
+        "The client wrote the link or token to stderr."
+    );
+    Ok((output.status.success(), stderr))
 }
 
 #[derive(Deserialize)]
@@ -300,9 +303,33 @@ async fn connect_bridge(config: &ClientConfig, server: &mut Server) -> Result<So
     let (mut ws, _) = client_async(format!("wss://{}/bridge", server.data), tls).await?;
     let hello = read_rpc(&mut ws).await?;
     assert_eq!(hello["method"], "relay/hello");
-    send_result(&mut ws, &hello, &json!({"policyVersion":1})).await?;
+    ensure!(
+        hello["params"]["policyVersion"] == 2,
+        "The relay did not announce policy version 2."
+    );
+    send_result(&mut ws, &hello, &json!({"policyVersion":2})).await?;
     matching_log(&mut server.logs, "Eclipse bridge connected.").await?;
     Ok(ws)
+}
+
+/// A forwarded tool call without its `relayAllowedTools`, after checking that list
+/// against the access rules the scenario set (source writes are not allowed).
+fn without_allowed_tools(mut params: Value) -> Result<Value> {
+    let allowed = params
+        .as_object_mut()
+        .and_then(|fields| fields.remove("relayAllowedTools"))
+        .context("The relay sent no relayAllowedTools.")?;
+    let names: Vec<_> = allowed
+        .as_array()
+        .context("relayAllowedTools is not a list.")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    ensure!(
+        names.contains(&"sap_get_source") && !names.contains(&"sap_set_source"),
+        "relayAllowedTools does not match the access rules."
+    );
+    Ok(params)
 }
 
 async fn read_rpc(ws: &mut Socket) -> Result<Value> {
@@ -403,13 +430,16 @@ async fn roundtrip(profile: &Path, server: &mut Server, config: &ClientConfig) -
     forwarded["relayPackageScopes"] = json!([["Z_TEST*"]]);
     desk.rpc(3, "tools/call", &params).await?;
     let call = read_rpc(&mut ws).await?;
-    assert_eq!(call["params"], forwarded);
+    assert_eq!(without_allowed_tools(call["params"].clone())?, forwarded);
     let result = json!({"content":[{"type":"text","text":"REPORT Z_EXAMPLE."}],"isError":false});
     send_result(&mut ws, &call, &result).await?;
     assert_eq!(desk.reply(3).await?["result"], result);
 
     desk.rpc(4, "tools/call", &params).await?;
-    assert_eq!(read_rpc(&mut ws).await?["params"], forwarded);
+    assert_eq!(
+        without_allowed_tools(read_rpc(&mut ws).await?["params"].clone())?,
+        forwarded
+    );
     // Losing the socket after dispatch leaves the outcome indeterminate.
     drop(ws);
     let failed = desk.reply(4).await?;
@@ -431,6 +461,29 @@ async fn roundtrip(profile: &Path, server: &mut Server, config: &ClientConfig) -
     Ok(())
 }
 
+/// The Enrollment tab lists what was enrolled, the log never holds a link or token, and the
+/// global rules and workspace grants are set through the TUI.
+async fn operate(operator: &Operator) -> Result<()> {
+    operator.visible("Alice Desktop  desktop").await?;
+    operator.keys(b"\t\t\t\t")?;
+    let logs = operator
+        .visible("Alice Desktop (desktop) enrolled from")
+        .await?;
+    ensure!(
+        !logs.contains("GW1-") && !logs.contains("sap-adt://"),
+        "A link or token reached the relay log."
+    );
+    operator.keys(b"\t")?;
+    operator.keys(b"\t\t")?;
+    operator.visible("Global Rules").await?;
+    operator.keys(b"\rp")?;
+    operator.visible("Separate package patterns").await?;
+    operator.keys(b"\x15Z_TEST*\rs")?;
+    operator.visible("Access rules saved.").await?;
+    endpoints::assign_workspaces(operator).await?;
+    Ok(())
+}
+
 async fn scenario() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let pki = directory.path().join("pki");
@@ -439,49 +492,29 @@ async fn scenario() -> Result<()> {
     let registration = Registration::start(&pki).await?;
     let ca = fs::read(pki.join("ca.pem"))?;
     let bootstrap = http(tls(&ca, None)?);
-    let request =
-        json!({"id":"11111111111111111111111111111111","role":"desktop","label":"Closed"});
-    let denied = bootstrap
+    // The request endpoint of the old approval flow is gone.
+    let request = json!({"id":"11111111111111111111111111111111","role":"desktop","label":"Old"});
+    let gone = bootstrap
         .post(format!("https://{}/request", registration.enrollment))
         .json(&request)
         .send()
         .await?;
-    assert_eq!(denied.status(), Status::Forbidden);
-    assert_eq!(denied.text().await?, "registration-closed");
-    // The operator sees that a request was turned away while closed.
-    registration
-        .operator
-        .visible("refused while closed")
-        .await?;
+    assert_eq!(gone.status(), Status::NotFound);
+    assert_eq!(gone.text().await?, "");
     let mcp = format!("https://{}/mcp", registration.data);
     assert!(bootstrap.post(&mcp).json(&json!({})).send().await.is_err());
-    registration.operator.keys(b"o")?;
-    registration.operator.visible("Enrollment · Open").await?;
+    registration.refused_links(directory.path()).await?;
     registration
-        .enroll_desktop(&directory.path().join("bad-pin"), "Bad Pin", true)
+        .enroll_desktop(&profile, "Alice Desktop")
         .await?;
-    registration
-        .enroll_desktop(&profile, "Alice Desktop", false)
-        .await?;
-    registration
-        .enroll_desktop(&bob, "Bob Desktop", false)
-        .await?;
+    registration.enroll_desktop(&bob, "Bob Desktop").await?;
     let eclipse = registration
         .eclipse_identity(&bootstrap, "Alice Eclipse")
         .await?;
     let bob_eclipse = registration
         .eclipse_identity(&bootstrap, "Bob Eclipse")
         .await?;
-    registration.operator.keys(b"\t\t")?;
-    registration.operator.visible("Global Rules").await?;
-    registration.operator.keys(b"\rp")?;
-    registration
-        .operator
-        .visible("Separate package patterns")
-        .await?;
-    registration.operator.keys(b"\x15Z_TEST*\rs")?;
-    registration.operator.visible("Access rules saved.").await?;
-    endpoints::assign_workspaces(&registration.operator).await?;
+    operate(&registration.operator).await?;
     let data = registration.data;
     let enrollment = registration.enrollment;
     drop(registration);
@@ -496,16 +529,23 @@ async fn scenario() -> Result<()> {
             "--pki",
         ])
         .arg(&pki)
+        // Links of this server live a few seconds, so that expiry can be tested.
+        .env("SAP_ADT_RELAY_TEST_LINK_TTL_MS", LINK_TTL_MS.to_string())
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
     let mut logs = BufReader::new(child.stderr.take().context("Missing headless logs.")?).lines();
     matching_log(&mut logs, "Headless mode.").await?;
-    ensure!(
-        TcpStream::connect(enrollment).await.is_err(),
-        "Headless enrollment socket is open."
-    );
+    matching_log(&mut logs, "Enrollment listening on").await?;
+    headless_issue::exercise(
+        &pki,
+        enrollment,
+        directory.path(),
+        &ca,
+        Duration::from_millis(LINK_TTL_MS),
+    )
+    .await?;
     let mut server = Server { child, logs, data };
     let config = tls(&ca, Some(&eclipse))?;
     let denied = http(config.clone())

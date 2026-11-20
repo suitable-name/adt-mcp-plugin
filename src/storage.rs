@@ -1,8 +1,38 @@
-use anyhow::{Context, Result};
-use std::{fs, io::Write, path::Path};
+//! Owner-only files: private directories, atomic writes and size-limited reads.
 
-/// All secret files inherit a private parent on Windows. No credential is
-/// written until the directory permissions have been installed successfully.
+use anyhow::{Context, Result, ensure};
+use std::{
+    fs::{self, File},
+    io::{Read, Write},
+    path::Path,
+};
+use zeroize::Zeroizing;
+
+/// The largest credential or key file this package reads.
+pub const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
+
+/// Reads a credential file of at most [`MAX_CREDENTIAL_BYTES`] into memory that is wiped on drop.
+///
+/// # Errors
+/// The file cannot be read or is larger than the limit.
+pub fn read_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    File::open(path)?
+        .take(MAX_CREDENTIAL_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_CREDENTIAL_BYTES,
+        "Credential file exceeds the size limit."
+    );
+    Ok(bytes)
+}
+
+/// Creates a new owner-only directory. All secret files inherit a private parent on Windows.
+/// No credential is written until the directory permissions have been installed successfully.
+///
+/// # Errors
+/// The directory exists already or cannot be created or restricted to its owner; a directory
+/// that was created but could not be restricted is removed again.
 pub fn new_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     let created = {
@@ -59,6 +89,10 @@ fn restrict_to_owner(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Writes `bytes` to a synced temporary file next to `path`; the caller persists it.
+///
+/// # Errors
+/// `path` has no parent directory, or the file cannot be created, written or synced.
 pub fn stage(path: &Path, bytes: &[u8]) -> Result<tempfile::NamedTempFile> {
     let mut file =
         tempfile::NamedTempFile::new_in(path.parent().context("Missing destination directory.")?)?;
@@ -67,6 +101,10 @@ pub fn stage(path: &Path, bytes: &[u8]) -> Result<tempfile::NamedTempFile> {
     Ok(file)
 }
 
+/// Writes `bytes` to `path`, which must not exist yet, atomically.
+///
+/// # Errors
+/// The file exists already or cannot be written.
 pub fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     // PersistError owns the staged file. Drop it before the caller rolls back the directory.
     stage(path, bytes)?

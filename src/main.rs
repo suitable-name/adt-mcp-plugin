@@ -1,19 +1,19 @@
 mod bridge;
-mod console;
 mod enrollment;
 mod logs;
 mod mcp;
 mod policy;
-mod rt;
 mod security;
 mod transport;
 mod tui;
+mod tunnel;
 mod web;
 
+use sap_adt_mcp_server_relay::{https, link, rt, tunnel_proto};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use smol::net::TcpListener;
 use tracing_subscriber::{EnvFilter, fmt::writer::BoxMakeWriter};
 use trillium_http::{KnownHeaderName, Method, Status};
@@ -26,13 +26,34 @@ use transport::{Conn, Handoff, Peer, PeerCertificate, Service, Upgrade};
 use web::Reply;
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "SAP ADT MCP relay with operator-approved certificate enrollment"
-)]
+#[command(version, about = "SAP ADT MCP relay with one-time enrollment links")]
 struct Args {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(ClapArgs)]
+struct ServeArgs {
+    #[arg(long)]
+    pki: PathBuf,
+    #[arg(long, default_value = "0.0.0.0:8787")]
+    listen: SocketAddr,
+    #[arg(long, default_value = "0.0.0.0:8788")]
+    enrollment_listen: SocketAddr,
+    /// Display name written into enrollment links. Default: the DNS name of the PKI.
+    #[arg(long)]
+    name: Option<String>,
+    /// Data (mutual TLS) address that enrollment links name, as host:port.
+    /// Default: the DNS name of the PKI with the bound data port.
+    #[arg(long, value_name = "HOST:PORT")]
+    public_data: Option<String>,
+    /// Enrollment address that enrollment links name, as host:port.
+    /// Default: the DNS name of the PKI with the bound enrollment port.
+    #[arg(long, value_name = "HOST:PORT")]
+    public_enrollment: Option<String>,
+    /// Show logs without the TUI. Mint enrollment links with `issue-link`.
+    #[arg(long)]
+    headless: bool,
 }
 
 #[derive(Subcommand)]
@@ -52,19 +73,20 @@ enum Command {
         dns: String,
     },
     /// Serve enrolled clients and open the local operator interface.
-    Serve {
+    Serve(ServeArgs),
+    /// Mint an enrollment link on the relay running on this machine and print it.
+    IssueLink {
+        /// The PKI directory the relay was started with.
         #[arg(long)]
         pki: PathBuf,
-        #[arg(long, default_value = "0.0.0.0:8787")]
-        listen: SocketAddr,
-        #[arg(long, default_value = "0.0.0.0:8788")]
-        enrollment_listen: SocketAddr,
-        /// Open registration on startup. Each request requires local operator approval.
+        #[arg(long, value_parser = ["desktop", "eclipse"])]
+        role: String,
+        /// Names the certificate in the Clients tab and in the logs.
         #[arg(long)]
-        issue_token: bool,
-        /// Show logs without the TUI. With --issue-token, prompt on the attached console.
-        #[arg(long)]
-        headless: bool,
+        label: String,
+        /// The enrollment listener of the relay, as host:port.
+        #[arg(long, default_value = "127.0.0.1:8788")]
+        relay: String,
     },
 }
 
@@ -72,16 +94,15 @@ fn main() -> Result<()> {
     smol::block_on(async_main())
 }
 
-#[allow(clippy::too_many_lines)]
 async fn async_main() -> Result<()> {
     let args = Args::parse();
     let logs = logs::Logs::default();
     let writer = if matches!(
         args.command,
-        Command::Serve {
+        Command::Serve(ServeArgs {
             headless: false,
             ..
-        }
+        })
     ) {
         BoxMakeWriter::new(logs.clone())
     } else {
@@ -115,76 +136,90 @@ async fn async_main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Serve {
+        Command::Serve(serve_args) => serve(serve_args, logs).await,
+        Command::IssueLink {
             pki,
-            listen,
-            enrollment_listen,
-            issue_token,
-            headless,
+            role,
+            label,
+            relay,
         } => {
-            let identity = Pki::load(&pki)?;
-            let policy = Arc::new(policy::PolicyStore::load(&pki)?);
-            let pki = Arc::new(identity);
-            let tls = pki.data_tls()?;
-            let relay = Relay::new(Arc::clone(&pki), Arc::clone(&policy));
-            // The operator interface reads live bridges and sessions from the same registry.
-            let registry = relay.registry.clone();
-            let enrollment = enrollment::Enrollment::new(Arc::clone(&pki), issue_token);
-            let network_enrollment = enrollment.clone();
-            let service = async move {
-                let socket = TcpListener::bind(listen)
-                    .await
-                    .context("Binding the mTLS listener")?;
-                tracing::info!(
-                    "Serving MCP and Eclipse over mutual TLS on {}.",
-                    socket.local_addr()?
-                );
-                if headless {
-                    if issue_token {
-                        tracing::info!(
-                            "Headless mode. Registration requires approval on the attached console."
-                        );
-                    } else {
-                        tracing::info!("Headless mode. Registration is closed.");
-                    }
-                }
-                let (stop, stopped) = smol::channel::bounded::<()>(1);
-                ctrlc::set_handler(move || {
-                    let _ = stop.try_send(());
-                })
-                .context("Receiving the shutdown signal")?;
-                smol::future::race(
-                    transport::listen(socket, tls, 128, relay),
-                    smol::future::race(
-                        enrollment::run(
-                            enrollment_listen,
-                            network_enrollment,
-                            !headless || issue_token,
-                        ),
-                        async {
-                            stopped
-                                .recv()
-                                .await
-                                .context("Receiving the shutdown signal")?;
-                            tracing::info!("Shutting down the relay.");
-                            Ok::<(), anyhow::Error>(())
-                        },
-                    ),
-                )
-                .await
-            };
-            match (headless, issue_token) {
-                (false, _) => tui::run(enrollment, pki, policy, registry, logs, service).await,
-                (true, true) => console::run(enrollment, service).await,
-                (true, false) => service.await,
-            }
+            // Only the link goes to standard output.
+            let link = enrollment::issue_link(&pki, &role, &label, &relay).await?;
+            println!("{}", link.as_str());
+            Ok(())
         }
+    }
+}
+
+async fn serve(args: ServeArgs, logs: logs::Logs) -> Result<()> {
+    let identity = Pki::load(&args.pki)?;
+    let policy = Arc::new(PolicyStore::load(&args.pki)?);
+    let pki = Arc::new(identity);
+    let tls = pki.data_tls()?;
+    let data_socket = TcpListener::bind(args.listen)
+        .await
+        .context("Binding the mTLS listener")?;
+    let enrollment_socket = TcpListener::bind(args.enrollment_listen)
+        .await
+        .context("Binding the enrollment listener")?;
+    let ports = (
+        data_socket.local_addr()?.port(),
+        enrollment_socket.local_addr()?.port(),
+    );
+    let addresses = enrollment::Addresses::resolve(
+        &pki,
+        args.name,
+        args.public_data,
+        args.public_enrollment,
+        ports,
+    )?;
+    let secret = pki.create_issue_secret()?;
+    let enrollment = enrollment::Enrollment::new(Arc::clone(&pki), addresses, secret);
+    let network_enrollment = enrollment.clone();
+    let relay = Relay::new(Arc::clone(&pki), Arc::clone(&policy));
+    // The operator interface reads live bridges and sessions from the same registry.
+    let registry = relay.registry.clone();
+    let headless = args.headless;
+    let service = async move {
+        tracing::info!(
+            "Serving MCP and Eclipse over mutual TLS on {}.",
+            data_socket.local_addr()?
+        );
+        if headless {
+            tracing::info!("Headless mode. Mint enrollment links with issue-link.");
+        }
+        let (stop, stopped) = smol::channel::bounded::<()>(1);
+        ctrlc::set_handler(move || {
+            let _ = stop.try_send(());
+        })
+        .context("Receiving the shutdown signal")?;
+        smol::future::race(
+            transport::listen(data_socket, tls, 128, relay),
+            smol::future::race(
+                enrollment::run(enrollment_socket, network_enrollment),
+                async {
+                    stopped
+                        .recv()
+                        .await
+                        .context("Receiving the shutdown signal")?;
+                    tracing::info!("Shutting down the relay.");
+                    Ok::<(), anyhow::Error>(())
+                },
+            ),
+        )
+        .await
+    };
+    if headless {
+        service.await
+    } else {
+        tui::run(enrollment, pki, policy, registry, logs, service).await
     }
 }
 
 #[derive(Clone)]
 struct Relay {
     registry: Registry,
+    tunnels: tunnel::Tunnels,
     pki: Arc<Pki>,
     policy: Arc<PolicyStore>,
 }
@@ -194,22 +229,31 @@ enum Route {
     Endpoints,
     Mcp,
     Bridge,
+    Tunnel,
+}
+
+/// What a request handler leaves for the WebSocket upgrade that follows its `101` answer.
+pub enum Pending {
+    Bridge(Bridge),
+    Tunnel(tunnel::Tunnel),
 }
 
 impl Relay {
     fn new(pki: Arc<Pki>, policy: Arc<PolicyStore>) -> Self {
         Self {
             registry: Registry::default(),
+            tunnels: tunnel::Tunnels::default(),
             pki,
             policy,
         }
     }
 
     /// Authorize a request for a known path, then dispatch it on its method.
-    async fn respond(&self, conn: &mut Conn, peer: &Peer, handoff: &Handoff<Bridge>) -> Reply {
+    async fn respond(&self, conn: &mut Conn, peer: &Peer, handoff: &Handoff<Pending>) -> Reply {
         let (route, role) = match conn.path() {
             "/mcp" => (Route::Mcp, "desktop"),
             "/endpoints" => (Route::Endpoints, "desktop"),
+            "/tunnel" => (Route::Tunnel, "desktop"),
             "/bridge" => (Route::Bridge, "eclipse"),
             _ => return Status::NotFound.into(),
         };
@@ -240,7 +284,7 @@ impl Relay {
         route: Route,
         cert: &PeerCertificate,
         addr: SocketAddr,
-        handoff: &Handoff<Bridge>,
+        handoff: &Handoff<Pending>,
     ) -> Reply {
         match (route, conn.method()) {
             (Route::Endpoints, Method::Get) => mcp::endpoints(self, cert).await,
@@ -252,7 +296,14 @@ impl Relay {
                 let (reply, bridge) =
                     bridge::upgrade(&self.registry, conn.request_headers(), cert, addr);
                 if let Some(bridge) = bridge {
-                    handoff.set(bridge);
+                    handoff.set(Pending::Bridge(bridge));
+                }
+                reply
+            }
+            (Route::Tunnel, Method::Get) => {
+                let (reply, tunnel) = tunnel::upgrade(self, conn.request_headers(), cert);
+                if let Some(tunnel) = tunnel {
+                    handoff.set(Pending::Tunnel(tunnel));
                 }
                 reply
             }
@@ -262,16 +313,25 @@ impl Relay {
 }
 
 impl Service for Relay {
-    type Pending = Bridge;
+    type Pending = Pending;
 
-    async fn handle(&self, mut conn: Conn, peer: &Peer, handoff: &Handoff<Bridge>) -> Conn {
+    async fn handle(&self, mut conn: Conn, peer: &Peer, handoff: &Handoff<Pending>) -> Conn {
         let reply = self.respond(&mut conn, peer, handoff).await;
         reply.into_conn(conn)
     }
 
-    async fn upgrade(&self, upgrade: Upgrade, peer: &Peer, pending: Option<Bridge>) {
-        if let (Some(bridge), Some(cert)) = (pending, &peer.cert) {
-            bridge::serve_upgraded(upgrade, bridge, &self.pki, cert).await;
+    async fn upgrade(&self, upgrade: Upgrade, peer: &Peer, pending: Option<Pending>) {
+        let Some(cert) = &peer.cert else {
+            return;
+        };
+        match pending {
+            Some(Pending::Bridge(bridge)) => {
+                bridge::serve_upgraded(upgrade, bridge, &self.pki, cert).await;
+            }
+            Some(Pending::Tunnel(tunnel)) => {
+                tunnel::serve_upgraded(upgrade, tunnel, self, cert, peer.addr).await;
+            }
+            None => {}
         }
     }
 }

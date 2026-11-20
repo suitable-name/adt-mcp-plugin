@@ -27,24 +27,49 @@ final class ScopedSapCall {
 
     static final class Denied extends Exception {
         private static final long serialVersionUID = 1L;
+        /** True when the relay's scopes allow the target and only this Eclipse's own patterns refuse it. */
+        final boolean local;
+
+        Denied() {
+            this(false);
+        }
+
+        Denied(boolean local) {
+            this.local = local;
+        }
     }
 
     private final AdtRestClient sap;
-    private final RelayPackageScopes scopes;
+    private final RelayPackageScopes relayScopes;
+    private final RelayPackageScopes localScopes;
 
-    ScopedSapCall(AdtRestClient sap, RelayPackageScopes scopes) {
+    ScopedSapCall(AdtRestClient sap, RelayPackageScopes relayScopes) {
+        this(sap, relayScopes, RelayPackageScopes.NONE);
+    }
+
+    /** A target must pass the relay's scopes and, in addition, this Eclipse's own local patterns. */
+    ScopedSapCall(AdtRestClient sap, RelayPackageScopes relayScopes, RelayPackageScopes localScopes) {
         this.sap = sap;
-        this.scopes = scopes;
+        this.relayScopes = relayScopes;
+        this.localScopes = localScopes;
+    }
+
+    private boolean permits(String sapPackage) {
+        return relayScopes.permits(sapPackage) && localScopes.permits(sapPackage);
+    }
+
+    private Denied deny(String sapPackage) {
+        return new Denied(relayScopes.permits(sapPackage) && !localScopes.permits(sapPackage));
     }
 
     String execute(McpTool tool, JsonObject args) throws Exception {
-        if (scopes.deniesAll()) throw new Denied();
-        if (tool instanceof SearchObjectTool search) return search.execute(args, scopes::permits);
+        if (relayScopes.deniesAll()) throw new Denied();
+        if (localScopes.deniesAll()) throw new Denied(true);
+        if (tool instanceof SearchObjectTool search) return search.execute(args, this::permits);
         if (tool instanceof CreateObjectTool) {
             String destination = args.get("parentName").getAsString();
-            if (!scopes.permits(destination) || !AdtUrlResolver.validObjectName(args.get("name").getAsString())) {
-                throw new Denied();
-            }
+            if (!permits(destination)) throw deny(destination);
+            if (!AdtUrlResolver.validObjectName(args.get("name").getAsString())) throw new Denied();
             // This is the exact destination written to the packageRef on the SAP create request.
             args.addProperty("parentName", destination.toUpperCase(Locale.ROOT));
             return tool.execute(args);
@@ -115,8 +140,9 @@ final class ScopedSapCall {
         try {
             String xml = sap.get(lookup, "application/*").body();
             String owner = AdtXmlParser.verifiedPackage(xml, name, family, uri);
-            if (scopes.permits(owner)) return new Metadata(xml, owner);
-        } catch (InterruptedException e) {
+            if (permits(owner)) return new Metadata(xml, owner);
+            throw deny(owner);
+        } catch (InterruptedException | Denied e) {
             throw e;
         } catch (Exception e) {
             // Missing objects, inaccessible metadata, and unproven packages have the same external result.

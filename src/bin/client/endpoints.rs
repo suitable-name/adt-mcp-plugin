@@ -31,8 +31,8 @@ pub fn read_selected(directory: &Path) -> Result<String> {
     Ok(selection.endpoint)
 }
 
-#[derive(Deserialize)]
-struct Endpoint {
+#[derive(Deserialize, Serialize)]
+pub struct Endpoint {
     id: String,
     label: String,
     online: bool,
@@ -43,7 +43,11 @@ struct Listing {
     endpoints: Vec<Endpoint>,
 }
 
-async fn available(directory: &Path) -> Result<Vec<Endpoint>> {
+/// The endpoints the relay has granted this profile (`GET /endpoints`).
+///
+/// # Errors
+/// The relay is unreachable or answers with an error or an invalid list.
+pub async fn available(directory: &Path) -> Result<Vec<Endpoint>> {
     let (client, mut url) = Profile::load(directory)?.connection()?;
     url.set_path("/endpoints");
     let reply = client
@@ -57,7 +61,7 @@ async fn available(directory: &Path) -> Result<Vec<Endpoint>> {
     // enrollment URL as its server is the usual cause of a 404 here.
     ensure!(
         status != Status::NotFound,
-        "The relay returned HTTP 404 for the endpoint list. Check that the profile's server URL ({}) is the relay's mutual-TLS port (default 8787, the same as the Eclipse bridge URL), not its registration port (default 8788).",
+        "The relay returned HTTP 404 for the endpoint list. Check that the profile's server URL ({}) is the relay's mutual-TLS port (default 8787, the same as the Eclipse bridge URL), not its enrollment port (default 8788). Enrolling again with a link from the relay operator sets it correctly.",
         url.origin().ascii_serialization()
     );
     ensure!(
@@ -127,6 +131,16 @@ fn save<'a>(directory: &Path, choice: &str, granted: &'a [Endpoint]) -> Result<&
         .persist(&path)
         .context("Could not save the selected endpoint.")?;
     Ok(id)
+}
+
+/// Saves the granted endpoint `id` as the selected one, without printing anything.
+///
+/// # Errors
+/// The relay has not granted this endpoint to the profile, or the file cannot be written.
+pub async fn select_id(directory: &Path, id: &str) -> Result<()> {
+    let endpoints = available(directory).await?;
+    save(directory, id, &endpoints)?;
+    Ok(())
 }
 
 pub async fn select(directory: &Path, choice: &str) -> Result<()> {

@@ -11,7 +11,7 @@ sequenceDiagram
     participant S as SAP
     E->>R: Open outbound mTLS WebSocket
     R->>E: relay/hello
-    E-->>R: policyVersion 1
+    E-->>R: policyVersion 2
     H->>C: initialize on stdio
     C->>R: POST /mcp over mTLS
     R-->>C: Server info and session ID
@@ -33,9 +33,9 @@ sequenceDiagram
 | [Server main](../src/main.rs) and [TLS transport](../src/transport.rs) | CLI modes, listener setup, peer certificate extraction, request authentication and limits |
 | [MCP endpoint](../src/mcp.rs) and [bridge](../src/bridge.rs) | MCP lifecycle, tool authorization, socket ownership, deadlines, and request correlation |
 | [Policy store](../src/policy.rs) | Known-action catalog, rule validation, global and desktop intersection, durable edits |
-| [PKI](../src/security.rs) and [enrollment](../src/enrollment.rs) | Issuance, role pins, revocation, request selection, and one-time claims |
+| [PKI](../src/security.rs) and [enrollment](../src/enrollment.rs) | Issuance, role pins, revocation, `issue.secret`, the one-time link store, and claims. [Link format](../src/link.rs) |
 | [TUI](../src/tui.rs), [rule editor](../src/tui/rules.rs), and [logs](../src/logs.rs) | Local operator actions, terminal lifecycle, bounded diagnostic history |
-| [Desktop client](../src/bin/sap-adt-mcp-client.rs) and [client modules](../src/bin/client) | Profile enrollment, bootstrap verifier, pinned TLS, stdio framing and session headers |
+| [Desktop client](../src/bin/sap-adt-mcp-client.rs) and [client modules](../src/bin/client) | Profile enrollment from a link, CA-pinning verifier, pinned TLS, stdio framing and session headers |
 | [Java server package](../java-plugin/sap-adt-mcp-server/com.sap.adt.mcp.server.plugin/src/com/sap/adt/mcp/server) | Relay identity, encrypted workspace profile, outbound WebSocket, JSON-RPC validation, and scoped execution |
 | [Java SAP tools](../java-plugin/sap-adt-mcp-server/com.sap.adt.mcp.server.plugin/src/com/sap/adt/mcp/tools) and [SAP transport](../java-plugin/sap-adt-mcp-server/com.sap.adt.mcp.server.plugin/src/com/sap/adt/mcp/sap) | ADT requests, tool schemas, object addressing, package metadata parsing, and SAP session state |
 | [Java UI](../java-plugin/sap-adt-mcp-server/com.sap.adt.mcp.server.plugin/src/com/sap/adt/mcp/ui) and [Tycho build](../java-plugin/sap-adt-mcp-server/pom.xml) | Registration and connection UI, plugin lifecycle, feature and p2 site assembly |
@@ -43,14 +43,14 @@ sequenceDiagram
 ## Enrollment and Trust
 
 1. `init` generates a dedicated CA and server identity in a new private directory. Both TLS listeners use the server leaf and CA chain. The enrollment listener permits initial connections without a client certificate. The data listener requires TLS 1.3 client authentication.
-2. A requester generates a random ID and posts `{"id":"<32 lowercase hex>","role":"desktop","label":"Anna desktop"}` to `/request`. Eclipse uses role `eclipse`. Initial contact is bootstrap traffic. Its fields carry no SAP credentials, bearer token, or private key. The operator sees the request ID, role, label, and TCP peer. A request waits up to 180 seconds for a decision.
-3. Approval rechecks the selected pending request and grants a fresh CSPRNG secret. The initial response carries only `id` and `ca_pem`. The local TUI dialog or headless approval terminal displays the secret and CA commitment in GW1 format. The 64-byte payload is 32 secret bytes followed by SHA-256 of the CA DER, encoded as 103 Crockford Base32 symbols. Groups of five are joined by hyphens after the `GW1-` prefix. The server retains the secret hash with the role, label, and independent 180-second claim deadline.
-4. The requester receives the token through the trusted operator channel, checks its CA commitment against the bootstrap CA, and creates a fresh TLS connection with that CA and hostname verification. Only this connection sends `POST /claim` with `{"token":"<GW1 token>"}`. The server compares the hash and CA pin in constant time, consumes the grant once, and returns `ca_pem`, `client_cert_pem`, and `client_key_pem`. A failed or lost claim may require a new request.
+2. The operator mints a one-time link: **N** in the TUI Enrollment tab, or `issue-link`, which sends `POST /issue` `{"role":"desktop","label":"Anna desktop"}` to the enrollment listener. `/issue` is accepted only from a loopback peer, without an `Origin` header, with `Authorization: Bearer <secret>` where the secret is the 64 hex characters of `<pki>/issue.secret` (created at every `serve` start, owner-only, compared in constant time). The relay generates a CSPRNG secret, stores only its SHA-256 with the role, label and expiry (10 minutes, single use, at most 16 outstanding), and returns the link as plain text. Minting is the approval; nothing is confirmed on claim.
+3. The link is `sap-adt://enroll?v=1&r=<role>&n=<name>&s=<data host:port>&e=<enrollment host:port>[&l=<label>]&t=<GW1 token>`, built and parsed by [`src/link.rs`](../src/link.rs) (shared by relay and client; the pairing link `sap-adt://pair?...` of the pairing phase lives there too). The shared vectors in `java-plugin/sap-adt-mcp-server/tests/link-vectors.json` fix the grammar and error codes for Rust and Java; the relay's tests regenerate their tokens so the file cannot drift. The token is the GW1 encoding: 32 secret bytes followed by SHA-256 of the CA DER, 103 Crockford Base32 symbols in groups of five after the `GW1-` prefix.
+4. The client parses the link and opens a TLS connection to `e` whose verifier takes the CA the relay presents (the last certificate of the chain) and refuses the handshake unless SHA-256 of that CA equals the fingerprint in the token, so the secret is never sent to another relay. Only then it sends `POST /claim` with `{"token":"<GW1 token>"}`. The server checks the CA pin first (no entry is consumed on a mismatch), then compares the hash in constant time, consumes the link once, and returns `ca_pem`, `client_cert_pem`, and `client_key_pem` for the stored role and label. Every wrong, used, expired or cancelled link gets the same bare 403. The desktop saves `server = https://<s>`.
 5. The signed client common name carries the role prefix. The server records SHA-256 of the issued leaf DER under that role. The PKI checks both signed role and current fingerprint membership. The desktop saves its profile under OS account permissions. Eclipse saves an AES-GCM-encrypted workspace profile with a wrapping key in Eclipse secure preferences.
 
-The enrollment registry is memory-only and bounded to 16 pending requests and grants together. Closing registration invalidates outstanding entries. Restarting drops the registry. Plain `--headless` leaves the enrollment port unbound. With `--headless --issue-token`, startup acquires an attached operator terminal, enables enrollment, and starts the enrollment listener. The console assigns a unique local number to each displayed request. Approval or denial selects that number and rechecks the pending request, so reusing a client-supplied ID cannot apply a stale decision to its replacement. Both operator interfaces use the same approval and claim lifecycle.
+The link store is memory-only and bounded to 16 outstanding links. Restarting drops it. The enrollment listener always runs, headless too, and accepts only `/claim` for stored links and loopback `/issue`; anything else is 404, 403 or 405. Each link has a number so that the TUI can cancel exactly the selected one. The link text is never stored or logged: it exists in the TUI dialog (zeroized when it closes) and in the output of `issue-link`. The test-only environment variable `SAP_ADT_RELAY_TEST_LINK_TTL_MS` can only shorten the lifetime, never extend it.
 
-Headless approval reads and writes through `/dev/tty` on Unix or the Windows console devices. Keep these handles separate from the diagnostic writer. A redirected stdin, stdout, or stderr must never become the approval channel, and failure to acquire the terminal must prevent startup.
+The relay's addresses in links come from `serve --name`, `--public-data` and `--public-enrollment`; the defaults are the DNS name read from the server certificate and the bound ports.
 
 ## Data Protocol
 
@@ -59,11 +59,12 @@ Headless approval reads and writes through `/dev/tty` on Unix or the Windows con
 | `GET /endpoints` | Requires an enrolled desktop certificate. Returns `{"endpoints":[{"id":"…","label":"…","online":true}]}` with enrolled Eclipse identities granted to this desktop. Works before selection and includes offline workspaces |
 | `POST /mcp` | One JSON-RPC object in an `application/json` body. Supports `initialize`, `ping`, `tools/list`, and `tools/call`. Valid notifications return HTTP 202 without a tool response |
 | `DELETE /mcp` | Releases the session identified by the session header after checking the desktop certificate and protocol version |
-| `GET /bridge` | WebSocket upgrade with an authorized Eclipse certificate. One UTF-8 JSON-RPC object per text message |
+| `GET /bridge` | WebSocket upgrade with an authorized Eclipse certificate. One UTF-8 JSON-RPC object per text message. With an `e2e` plugin, also tunnel control and data frames (see [Tunnel and Streams](#tunnel-and-streams)) |
+| `GET /tunnel` | WebSocket upgrade with an authorized desktop certificate (same certificate and `Origin` checks as `/mcp`). One tunnel per desktop client process carries many end-to-end streams |
 
 The desktop helper sends the selected Eclipse certificate's lowercase SHA-256 fingerprint in the `X-Sap-Adt-Endpoint` header. Initialization checks the grant and live bridge, then binds the session to that desktop identity and connection. The helper retains the negotiated `MCP-Protocol-Version` and `Mcp-Session-Id`. Every subsequent request checks session ownership and endpoint access. The relay answers `relay_list_endpoints` locally, returning the selected ID and the caller's authorized catalog. The host sees newline-delimited JSON-RPC on stdio. Diagnostics go to stderr. A browser-provided `Origin` is refused.
 
-Rust sends `relay/hello` on a new bridge and requires an object containing numeric `policyVersion: 1` before allowing a session to initialize. Rust then sends `ping`, `tools/list`, and `tools/call` using its own positive integer IDs. Eclipse replies with the same bridge ID and exactly one result or error. The relay preserves the desktop's original MCP request ID independently. A malformed reply, mismatched ID, unexpected message, or timeout closes that bridge.
+Rust sends `relay/hello` with `{"policyVersion": 2}` on a new bridge and requires an object containing numeric `policyVersion` 1 or 2 before allowing a session to initialize. With version 2, every `tools/list` and `tools/call` carries `relayAllowedTools`, and the plugin refuses a tool outside that list and its own local permissions; a version-2 plugin accepts a missing list only from a relay that never announced version 2. Rust then sends `ping`, `tools/list`, and `tools/call` using its own positive integer IDs. Eclipse replies with the same bridge ID and exactly one result or error. The relay preserves the desktop's original MCP request ID independently. A malformed reply, mismatched ID, unexpected message, or timeout closes that bridge.
 
 Rust constructs the call sent to Eclipse from the authorized tool name, original tool arguments, and effective package constraints. The following is an internal bridge message.
 
@@ -82,6 +83,45 @@ Rust constructs the call sent to Eclipse from the authorized tool name, original
 
 An outer empty array represents unrestricted packages. Each inner list is a disjunction. A verified target must satisfy every inner list. An empty inner list permits no target. Client-supplied policy fields have no authority. Eclipse validates the envelope, tool arguments, and scope patterns before dispatch.
 
+## Tunnel and Streams
+
+The relay side of the end-to-end tunnel (`docs/plan-e2e-envelope.md`). The wire format is in [`src/tunnel_proto.rs`](../src/tunnel_proto.rs), shared with the client; the Java plugin implements the same format. The relay never reads stream payload bytes. It forwards control frames and data frames, enforces its rules on clear-text envelopes, and measures traffic.
+
+| Module | Responsibility |
+| --- | --- |
+| [`src/tunnel.rs`](../src/tunnel.rs) | `GET /tunnel` upgrade, one session per desktop tunnel (frame loop, 1 s timer, policy re-check every 5 s, ping every 30 s), tunnel limits (4 per desktop, 256 in total) |
+| [`src/tunnel/hub.rs`](../src/tunnel/hub.rs) | The streams of one bridge: bridge-side ID allocation and translation, limits, policy fingerprint, statistics (`StreamRow`, `Registry::stream_snapshot`) |
+| [`src/tunnel/admission.rs`](../src/tunnel/admission.rs) | Pre-admission state machine of one stream |
+| [`src/bridge.rs`](../src/bridge.rs) | Bridge connection: writer, reader and legacy driver, see below |
+
+**Bridge capability.** The plugin's `relay/hello` reply may contain `"e2e": 1`. Only then does the hub accept streams. Legacy JSON-RPC calls (`/mcp`) keep working on the same bridge in this version.
+
+**Bridge connection.** One task races three futures. The *writer* drains one bounded queue of WebSocket messages (legacy requests, stream control frames and data frames, in queue order). The *reader* routes what the plugin sends: control frames (a text frame that decodes as a `Control`, which has a top-level `type`) and data frames go to the hub, any other text frame is a legacy reply. The *driver* runs `relay/hello`, the legacy calls and the heartbeat exactly as before: one call at a time (the `Semaphore` of `Client`), the same deadlines and errors, and any malformed, mismatched or unsolicited legacy reply closes the bridge. A legacy reply is accepted only while an exchange waits for it. The reader never waits on the bridge queue (it uses `try_send`, or a detached task for a `Close`), so a slow bridge cannot deadlock it.
+
+**Stream lifecycle.** `Open {stream, endpoint}` from the desktop is checked like `/mcp` initialization (`mcp::endpoint_policy`: grant and enrolled Eclipse), then against the bridge (ready, `e2e`) and the limits: 128 streams per bridge, 16 per desktop and endpoint. The relay allocates a bridge-side ID and sends `Open {stream, endpoint, desktop, label}` to the plugin, or answers the desktop with `Close` and a plain reason. The first `Admit` counts as the end of the inner handshake; a stream without one within 30 s is closed. Data frames are forwarded in order with translated IDs. `Close` from either side ends both legs; losing the tunnel or the bridge ends all its streams with a reason. Streams without traffic for eight hours are closed.
+
+**Admission.** Each `Admit` carries the envelope of the request that will follow. The relay refuses it (`Denied`, code `-32001`, nothing changes) when `seq` is not exactly one more than the last admitted one (the first is 1), or for `tools/call` when the tool is unknown, its class differs from the shared tool table, or the effective policy does not allow it. Other methods are always admitted. An admitted envelope waits 30 s (up to eight at once). The `Request` must carry exactly the admitted envelope, oldest first; the relay adds the policy (`allowedTools`, `packageScopes`) and forwards it. A request without admission, with a different envelope, or after the deadline closes the stream, and so does an admission whose request never comes. The relay does not evaluate policy again at `Request`, because dropping bytes would break the inner TLS.
+
+**Policy changes.** Each stream remembers the `RelayPolicy` (allowed tools and package scopes) it opened with. The relay reads the effective policy again on every `Admit` and every five seconds for each tunnel, and closes a stream with "The access rules changed." when the value differs or the grant is gone. It never drops single requests.
+
+**Statistics.** The hub records, per stream, the request count, last method, tool and status, bytes in each direction, whether the first `Admit` arrived (the inner handshake is done), and the admit-to-response time that the relay measured. `Registry::stream_snapshot` returns `StreamRow` values for the Connections tab. Logs carry endpoint, desktop fingerprint prefix, tool, class and decision, never payload bytes.
+
+## Client: Keys, Pairing and the Encrypted Path
+
+The desktop client side of the tunnel lives in [`src/bin/client`](../src/bin/client) and shares [`src/tunnel_proto.rs`](../src/tunnel_proto.rs) with the relay.
+
+| Module | Responsibility |
+| --- | --- |
+| `keys.rs` | `inner_key.pem` and `inner_cert.pem` (ECDSA P-256, self-signed, owner-only); the pin is SHA-256 of the SPKI DER; short form is 16 hex characters in groups of four |
+| `peers.rs` | `peers.json` (endpoint ID to key, label, `pairedAt`), atomic replace, the `Route` decision (a pin means tunnel, never `/mcp`), `unpair` |
+| `tunnel.rs` | One `wss://…/tunnel` socket per process (mTLS from the profile); reader and writer tasks; client-chosen stream IDs; `Stream` events |
+| `inner_tls.rs` | rustls sans-IO client: TLS 1.3, `TLS_AES_256_GCM_SHA384`, x25519 and secp256r1, client certificate = inner key, no resumption, SPKI-pinned server verifier |
+| `channel.rs` | Handshake, then per message `Admit`, `Admitted`, `Request` plus data, `Response` plus data; `tools.json` copy for the envelope class |
+| `host.rs` | stdio host for a paired endpoint; local `relay_list_endpoints`; no `/mcp` fallback |
+| `pair.rs` | `pair --link`: pinned handshake, `pair/claim` inside the session, then `peers.json` and the endpoint selection |
+
+A denial happens before encryption, so it advances neither `seq` nor the TLS stream: the next message reuses the same `seq`. Any other failure marks the channel broken, and the host must initialize a new session (a new stream). A damaged `peers.json` is an error, never "unpaired".
+
 ## Authorization
 
 The PKI directory contains `policy.json` and a persistent `policy.lock`. The `endpoint_grants` map associates a desktop certificate fingerprint with its permitted Eclipse fingerprints. An absent map, absent entry, or empty grant list permits no workspace access. Re-enrollment creates a new identity. A label is display data. Independently, global and desktop rules each contain `read_only`, `actions`, and `packages`. A JSON `null` action or package list is unrestricted, while an empty array permits none. A missing desktop rule override means read-only with unrestricted lists. Global rules default to all recognized SAP actions.
@@ -97,6 +137,8 @@ Discovery filters Eclipse's schemas using effective access. Direct invocation in
 
 A source write also requires permission for lock, unlock, and activate in both rule layers. Classify new tool names explicitly. The relay rejects unknown tools even under unrestricted action lists.
 
+The table above is derived from one file, [`resources/tools.json`](../java-plugin/sap-adt-mcp-server/com.sap.adt.mcp.server.plugin/resources/tools.json), the single source for tool names, action class, package awareness, and component actions. Each entry has `name`, `class` (`read`, `execute`, or `write`), `packageAware`, and `components` (extra tools that must also be permitted; `sap_set_source` lists `sap_lock`, `sap_unlock`, and `sap_activate`). The relay embeds the file with `include_str!` in `src/policy.rs` (`tool_class`, observational and package checks, component rule). The plugin bundles it as a resource and `ToolCatalog` loads it. Every `McpTool` declares `toolClass()`, and `ToolCatalog.verify` fails at startup when a registered tool is missing from the file or declares another class. To add or reclassify a tool, edit the file, the `TOOLS` constant, and the Java tool together; the `policy` unit tests and `ToolCatalogRegression` fail when they diverge.
+
 Package patterns are canonicalized to uppercase. Exact names and a single trailing wildcard are supported, including `$TMP`, `ZFI*`, and `/ACME/*`. Each layer supports up to 64 patterns and the literal portion of a pattern is at most 30 characters. In the operator package editor, entering a lone `*` saves unrestricted access. In the wire format, a pattern `"*"` inside a layer still requires a verified package.
 
 In the plugin, scoped search filters hits by verified ownership. For existing objects, scoped calls resolve supported object type and name and verify the corresponding SAP metadata. Missing metadata or conflicting identity fails closed. Structure reads use the verified metadata response. Source reads recheck ownership after retrieval, and source writes verify again while acquiring the lock. Scoped unlock requires the handle recorded for that target in the active SAP session. Creation checks the destination package written into the create request. A scoped policy constrains operation targets. It does not inspect the semantics of ABAP source code.
@@ -107,7 +149,7 @@ In the plugin, scoped search filters hits by verified ownership. For existing ob
 * Each session also belongs to the desktop certificate that initialized it. Reusing another desktop's session ID fails. Each endpoint allows 128 sessions and expires idle sessions after eight hours. Desktop revocation takes effect at the HTTP boundary. The relay rechecks the Eclipse pin before dispatch and on idle heartbeats.
 * Each Eclipse SAP client is stateful, including locks. Each bridge admits one call at a time. Overlapping calls on that bridge receive a busy error. Calls on different bridges are independent. Idle heartbeat interval and deadline are 20 seconds. Bridge calls have a ten-minute deadline. A disconnected or timed-out mutation has an uncertain SAP outcome. Preserve that error to the host and avoid automatic replay.
 * The data listener accepts at most 128 concurrent TLS/HTTP connection slots and enrollment uses a separate budget of 32. Both constrain TLS handshake and header read time. The desktop request and Java incoming request limits are 4 MiB. The bridge accepts a response up to 8 MiB. The stdio client bounds concurrency and response size.
-* Logging can include the authorized tool name, desktop fingerprint, and connection or policy events. Exclude request bodies, SAP results, token strings, and private keys. Interactive logs are bounded in memory. Headless logging uses stderr. TUI token copy uses an explicit OSC 52 clipboard request.
+* Logging can include the authorized tool name, desktop fingerprint, and connection or policy events. Exclude request bodies, SAP results, enrollment links, token strings, and private keys. Interactive logs are bounded in memory. Headless logging uses stderr. TUI link copy uses an explicit OSC 52 clipboard request.
 
 ## ADT Project Connection
 

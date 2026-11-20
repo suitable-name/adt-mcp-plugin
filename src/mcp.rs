@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::Relay;
 use crate::bridge::{Client, Outcome, activity, error};
-use crate::policy::{Effective, PolicyStore};
+use crate::policy::{Effective, PolicyStore, TOOLS};
 use crate::security::{Pki, valid_fingerprint};
 use crate::transport::{Conn, PeerCertificate};
 use crate::web::{Reply, is_json};
@@ -19,6 +19,8 @@ const VERSION: &str = "2025-11-25";
 const ENDPOINT_HEADER: &str = "x-sap-adt-endpoint";
 const ENDPOINT_TOOL: &str = "relay_list_endpoints";
 const SELECT_ENDPOINT: &str = "Run sap-adt-mcp-client endpoints --profile <dir>, then sap-adt-mcp-client --set-endpoint=<id> --profile <dir> and reconnect.";
+
+const REQUIRE_E2E: &str = "This Eclipse endpoint requires end-to-end encryption. Pair this desktop with sap-adt-mcp-client pair --link <link from Eclipse> and reconnect.";
 
 #[derive(Serialize)]
 struct Endpoint {
@@ -81,7 +83,7 @@ pub async fn endpoints(relay: &Relay, cert: &PeerCertificate) -> Reply {
     }
 }
 
-async fn endpoint_policy(
+pub async fn endpoint_policy(
     relay: &Relay,
     cert: &PeerCertificate,
     endpoint: &str,
@@ -145,6 +147,11 @@ async fn lookup(
         return Err(Status::BadRequest);
     }
     let policy = match endpoint_policy(relay, cert, &client.endpoint).await {
+        Ok(policy) if policy.e2e_required() => {
+            // The endpoint became encrypted-only: this unencrypted session ends here.
+            relay.registry.remove(&client.endpoint, id);
+            return Err(Status::UpgradeRequired);
+        }
         Ok(policy) => policy,
         Err(status) => {
             if status == Status::Forbidden {
@@ -194,8 +201,12 @@ async fn initialize(
             ),
         );
     };
-    if let Err(status) = endpoint_policy(relay, cert, endpoint).await {
-        return access_error(status, id);
+    match endpoint_policy(relay, cert, endpoint).await {
+        Ok(policy) if policy.e2e_required() => {
+            return access_error(Status::UpgradeRequired, id);
+        }
+        Ok(_) => {}
+        Err(status) => return access_error(status, id),
     }
     let session = match relay
         .registry
@@ -239,15 +250,19 @@ fn validate(message: &Value) -> bool {
         && message.get("error").is_none()
 }
 
-fn access_error(status: Status, id: &Value) -> Reply {
-    let message = match status {
+fn access_message(status: Status) -> String {
+    match status {
+        Status::UpgradeRequired => REQUIRE_E2E.to_owned(),
         Status::Forbidden => {
             format!("This endpoint is unavailable to this desktop. {SELECT_ENDPOINT}")
         }
         Status::ServiceUnavailable => "The access policy is unavailable.".to_owned(),
         _ => "A valid MCP session for this endpoint is required.".to_owned(),
-    };
-    rpc_error(status, id, error(-32_000, &message))
+    }
+}
+
+fn access_error(status: Status, id: &Value) -> Reply {
+    rpc_error(status, id, error(-32_000, &access_message(status)))
 }
 
 pub async fn request(
@@ -340,6 +355,15 @@ pub async fn request(
     }
 }
 
+/// The tool names this relay allows the desktop, sent to Eclipse with each call.
+fn allowed_tools(policy: &Effective) -> Vec<&'static str> {
+    TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| policy.allows(tool))
+        .collect()
+}
+
 async fn dispatch(
     client: &Client,
     method: &str,
@@ -350,7 +374,9 @@ async fn dispatch(
     match method {
         "ping" => Ok(json!({})),
         "tools/list" => {
-            let mut result = client.call("tools/list", params).await?;
+            // The plugin is the authority: it lists only tools in this set that its own permissions allow.
+            let request = json!({"relayAllowedTools": allowed_tools(policy)});
+            let mut result = client.call("tools/list", request).await?;
             let tools = result["tools"]
                 .as_array_mut()
                 .ok_or_else(|| error(-32603, "Invalid tool list from Eclipse."))?;
@@ -381,7 +407,11 @@ async fn dispatch(
             }
             tracing::info!(%desktop, tool = name, "Admitted a tool call.");
             // Construct this envelope from scratch. Package constraints belong to the relay.
-            let mut call = json!({"name":name, "relayPackageScopes":policy.package_scopes()});
+            let mut call = json!({
+                "name":name,
+                "relayPackageScopes":policy.package_scopes(),
+                "relayAllowedTools":allowed_tools(policy),
+            });
             if let Some(arguments) = params.get("arguments") {
                 call["arguments"] = arguments.clone();
             }
@@ -423,7 +453,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let tools = json!({"tools": [{"name": "sap_set_source"}, {"name": "sap_search_object"}]});
-        let (client, list_call) = Client::expecting("tools/list", Value::Null, tools);
+        let allowed = allowed_tools(&policy);
+        assert!(allowed.contains(&"sap_search_object") && !allowed.contains(&"sap_set_source"));
+        let list_request = json!({"relayAllowedTools": allowed});
+        let (client, list_call) = Client::expecting("tools/list", list_request, tools);
         let listed = dispatch(&client, "tools/list", Value::Null, &policy, owner)
             .await
             .unwrap();
@@ -444,7 +477,7 @@ mod tests {
             -32_001
         );
         let params = json!({"name":"sap_search_object", "arguments":{"query":"Z*"}, "relayPackageScopes":[["*"]]});
-        let forwarded = json!({"name":"sap_search_object", "arguments":{"query":"Z*"}, "relayPackageScopes":[]});
+        let forwarded = json!({"name":"sap_search_object", "arguments":{"query":"Z*"}, "relayPackageScopes":[], "relayAllowedTools":allowed_tools(&policy)});
         let result = json!({"content": [{"type": "text", "text": "found"}], "isError": false});
         let (client, search_call) = Client::expecting("tools/call", forwarded, result.clone());
         assert_eq!(
@@ -452,5 +485,34 @@ mod tests {
             Ok(result)
         );
         search_call.await;
+    }
+
+    #[test]
+    fn required_e2e_refuses_unencrypted_sessions_with_the_pairing_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = [1; 32];
+        let store = crate::policy::PolicyStore::load(dir.path()).unwrap();
+        let endpoint = hex::encode([2; 32]);
+        store
+            .set_endpoint_grants(
+                &store.snapshot().unwrap().revision,
+                &hex::encode(owner),
+                vec![endpoint.clone()],
+            )
+            .unwrap();
+        let allowed = |store: &PolicyStore| {
+            !store
+                .effective_for_endpoint(&owner, &endpoint)
+                .unwrap()
+                .unwrap()
+                .e2e_required()
+        };
+        assert!(allowed(&store));
+        assert!(store.toggle_endpoint_e2e(&endpoint).unwrap());
+        assert!(!allowed(&store));
+        let message = access_message(Status::UpgradeRequired);
+        assert!(message.contains("requires end-to-end encryption"));
+        assert!(message.contains("sap-adt-mcp-client pair --link"));
+        assert_ne!(message, access_message(Status::NotFound));
     }
 }

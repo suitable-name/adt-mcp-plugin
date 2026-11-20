@@ -44,11 +44,6 @@ impl Screen {
         self.lock().closed = true;
     }
 
-    /// The screen text as of now.
-    pub(super) fn current(&self) -> String {
-        self.lock().contents.clone()
-    }
-
     /// Wait until `ready` accepts the screen text; fails once the terminal output has ended.
     pub(super) async fn wait_for(
         &self,

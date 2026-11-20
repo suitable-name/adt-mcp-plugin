@@ -17,6 +17,12 @@ public interface McpTool {
     String getName();
 
     /**
+     * Returns the action class of this tool. It must equal the class listed for
+     * {@link #getName()} in resources/tools.json ({@link ToolCatalog#verify}).
+     */
+    ToolClass toolClass();
+
+    /**
      * Returns a human-readable description of what this tool does.
      * Claude Code uses this to decide when to use the tool.
      */

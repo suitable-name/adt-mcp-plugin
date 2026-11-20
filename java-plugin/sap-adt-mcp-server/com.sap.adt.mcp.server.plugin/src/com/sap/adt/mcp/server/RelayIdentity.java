@@ -31,6 +31,8 @@ import javax.net.ssl.X509ExtendedTrustManager;
 import javax.net.ssl.SSLEngine;
 import java.net.Socket;
 import javax.security.auth.x500.X500Principal;
+import javax.naming.InvalidNameException;
+import javax.naming.ldap.LdapName;
 import javax.naming.ldap.Rdn;
 
 import com.google.gson.JsonElement;
@@ -111,9 +113,12 @@ public final class RelayIdentity {
         throw new GeneralSecurityException("An endpoint-aware PKIX trust manager is required.");
     }
 
-    /** Only for the public registration request. No token or identity can be attached here. */
-    static HttpClient registrationClient() throws GeneralSecurityException {
-        return httpClient(null, new TrustManager[] {new PresentedAuthority()});
+    /**
+     * Only for the enrollment claim. No identity can be attached here, and the handshake fails
+     * unless the relay presents the CA the link's token pins.
+     */
+    static HttpClient registrationClient(PinnedAuthority pinned) throws GeneralSecurityException {
+        return httpClient(null, new TrustManager[] {pinned});
     }
 
     private static HttpClient httpClient(KeyManager[] keys, TrustManager[] trust) throws GeneralSecurityException {
@@ -128,31 +133,62 @@ public final class RelayIdentity {
                 .followRedirects(HttpClient.Redirect.NEVER).build();
     }
 
-    /** Public bootstrap trusts the presented root for this handshake only. Standard PKIX checks
-     * signatures, validity, and the endpoint hostname using the actual socket or engine. */
-    private static final class PresentedAuthority extends X509ExtendedTrustManager {
-        private static X509ExtendedTrustManager provisional(X509Certificate[] chain) throws CertificateException {
-            if (chain == null || chain.length < 2) throw new CertificateException("Missing registration CA.");
-            X509Certificate ca = chain[chain.length - 1];
+    /** The presented chain holds no certificate with the fingerprint the enrollment link pins. */
+    static final class PinMismatch extends CertificateException {
+        private static final long serialVersionUID = 1L;
+
+        PinMismatch() {
+            super("The relay did not present the pinned CA.");
+        }
+    }
+
+    /**
+     * Enrollment trust: during the handshake, and so before the claim secret is sent, requires a
+     * certificate in the presented chain whose SHA-256 equals the fingerprint pinned by the link's
+     * token, then validates the chain with PKIX using that certificate as the only trust anchor.
+     * Standard PKIX checks signatures, validity, and the endpoint hostname using the actual socket
+     * or engine.
+     */
+    static final class PinnedAuthority extends X509ExtendedTrustManager {
+        private final byte[] pinned;
+        private volatile boolean mismatched;
+
+        PinnedAuthority(byte[] pinnedFingerprint) {
+            this.pinned = pinnedFingerprint.clone();
+        }
+
+        /** True once a handshake was refused because the pinned CA was not presented. */
+        boolean mismatched() { return mismatched; }
+
+        private X509ExtendedTrustManager anchored(X509Certificate[] chain) throws CertificateException {
+            if (chain == null || chain.length == 0) {
+                mismatched = true;
+                throw new PinMismatch();
+            }
             try {
-                ca.checkValidity();
-                if (ca.getBasicConstraints() < 0 || !ca.getSubjectX500Principal().equals(ca.getIssuerX500Principal())) {
-                    throw new CertificateException("Invalid registration CA.");
+                // The enrollment listener sends the CA last, so search from the end.
+                for (int i = chain.length - 1; i >= 0; i--) {
+                    if (MessageDigest.isEqual(pinned, fingerprint(chain[i]))) {
+                        X509Certificate ca = chain[i];
+                        if (ca.getBasicConstraints() < 0) break;
+                        ca.checkValidity();
+                        return trustManager(ca);
+                    }
                 }
-                ca.verify(ca.getPublicKey());
-                return trustManager(ca);
             } catch (GeneralSecurityException | IOException e) {
                 throw new CertificateException("Could not validate the registration CA.", e);
             }
+            mismatched = true;
+            throw new PinMismatch();
         }
 
         @Override
         public void checkServerTrusted(X509Certificate[] chain, String auth, SSLEngine engine) throws CertificateException {
-            provisional(chain).checkServerTrusted(chain, auth, engine);
+            anchored(chain).checkServerTrusted(chain, auth, engine);
         }
         @Override
         public void checkServerTrusted(X509Certificate[] chain, String auth, Socket socket) throws CertificateException {
-            provisional(chain).checkServerTrusted(chain, auth, socket);
+            anchored(chain).checkServerTrusted(chain, auth, socket);
         }
         @Override
         public void checkServerTrusted(X509Certificate[] chain, String auth) throws CertificateException {
@@ -203,6 +239,25 @@ public final class RelayIdentity {
         return ca;
     }
 
+    /**
+     * The label the relay put into an issued Eclipse certificate (subject CN {@code eclipse:<label>}).
+     * The relay's stored label wins over the link's optional one, so the profile takes it from here.
+     */
+    static String certificateLabel(String certificatePem) throws GeneralSecurityException {
+        X509Certificate leaf = certificate(certificatePem);
+        try {
+            for (Rdn rdn : new LdapName(leaf.getSubjectX500Principal().getName(X500Principal.RFC2253)).getRdns()) {
+                if (rdn.getType().equalsIgnoreCase("CN") && rdn.getValue() instanceof String cn
+                        && cn.startsWith("eclipse:") && cn.length() > "eclipse:".length()) {
+                    return cn.substring("eclipse:".length());
+                }
+            }
+        } catch (InvalidNameException e) {
+            throw new GeneralSecurityException("Invalid relay client certificate.", e);
+        }
+        throw new GeneralSecurityException("Invalid relay client certificate.");
+    }
+
     static byte[] fingerprint(X509Certificate certificate) throws GeneralSecurityException {
         return MessageDigest.getInstance("SHA-256").digest(certificate.getEncoded());
     }
@@ -230,5 +285,24 @@ public final class RelayIdentity {
 
     JsonObject profile() {
         return profile;
+    }
+
+    /** This Eclipse's label as the relay certificate names it. */
+    public String label() throws IOException {
+        return string(profile, "label");
+    }
+
+    /**
+     * This Eclipse's relay fingerprint, the endpoint ID: lowercase hex SHA-256 of its relay client certificate.
+     *
+     * @throws GeneralSecurityException if the stored certificate is unusable
+     */
+    public String relayFingerprint() throws GeneralSecurityException, IOException {
+        byte[] digest = fingerprint(certificate(string(profile, "client_cert_pem")));
+        StringBuilder hex = new StringBuilder(64);
+        for (byte b : digest) {
+            hex.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+        }
+        return hex.toString();
     }
 }

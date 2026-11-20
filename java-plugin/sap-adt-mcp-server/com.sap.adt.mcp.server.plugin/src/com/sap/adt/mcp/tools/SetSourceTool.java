@@ -19,6 +19,11 @@ public class SetSourceTool extends AbstractMcpTool {
     }
 
     @Override
+    public ToolClass toolClass() {
+        return ToolClass.WRITE;
+    }
+
+    @Override
     public String getName() {
         return NAME;
     }

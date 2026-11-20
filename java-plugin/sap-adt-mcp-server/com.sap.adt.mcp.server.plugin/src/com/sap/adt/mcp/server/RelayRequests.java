@@ -1,36 +1,65 @@
 package com.sap.adt.mcp.server;
 
-import java.nio.charset.StandardCharsets;
-import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.Strictness;
 import com.sap.adt.mcp.tools.McpTool;
-import com.sap.adt.mcp.tools.SearchObjectTool;
+import com.sap.adt.mcp.tools.ToolCatalog;
 import com.sap.adt.mcp.sap.AdtRestClient;
 
-/** Discovers and dispatches the tools attached to this Eclipse SAP session. */
+/**
+ * The legacy (unencrypted) bridge path: discovers and dispatches the tools attached to this Eclipse SAP session.
+ *
+ * <p>This class is the authority for what runs. A tool executes only if the relay listed it in
+ * {@code relayAllowedTools} and this Eclipse's local permissions allow it, and a package-aware tool's
+ * target must pass the relay's package scopes and the local patterns. The checks and the execution live in
+ * {@link ToolExecutor}, which the encrypted stream path shares.</p>
+ */
 final class RelayRequests {
-    private static final int MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+    /** The relay refused or did not list the tool. */
+    static final int RELAY_DENIED = ToolExecutor.RELAY_DENIED;
+    /** This Eclipse's local permissions refused the call. */
+    static final int LOCAL_DENIED = ToolExecutor.LOCAL_DENIED;
+    static final int POLICY_VERSION = 2;
+    /** Advertised in {@code relay/hello}: this plugin can serve encrypted streams. */
+    static final int E2E_VERSION = 1;
+    /** The message of the {@link #LOCAL_DENIED} error for a refused legacy call. */
+    static final String UNENCRYPTED_REFUSED =
+            "This Eclipse accepts only end-to-end encrypted calls. Pair this desktop with Pair Desktop in the MCP view.";
+    private static final int MAX_RELAY_TOOLS = 256;
     private static final Gson JSON = new GsonBuilder().setStrictness(Strictness.STRICT).create();
-    private final Map<String, McpTool> tools = new LinkedHashMap<>();
-    private final AdtRestClient sapSession;
+    private final ToolExecutor executor;
+    private final Supplier<LocalPolicy> localPolicy;
+    private final BooleanSupplier allowUnencrypted;
+    /** Set once the relay's hello advertised policy version 2. After that every call must carry its tool list. */
+    private volatile boolean relaySendsToolList;
 
+    /** Production constructor: the bundled tool table and the Eclipse preferences, read again on every call. */
     RelayRequests(List<McpTool> registeredTools, AdtRestClient sapSession) {
-        this.sapSession = sapSession;
-        for (McpTool tool : registeredTools) {
-            if (tools.putIfAbsent(tool.getName(), tool) != null) {
-                throw new IllegalArgumentException("Duplicate SAP tool.");
-            }
-        }
+        this(registeredTools, sapSession, ToolCatalog.bundled(), LocalPolicySource::current);
+    }
+
+    RelayRequests(List<McpTool> registeredTools, AdtRestClient sapSession, ToolCatalog catalog,
+            Supplier<LocalPolicy> localPolicy) {
+        this(registeredTools, sapSession, catalog, localPolicy, LegacyCalls::allowed);
+    }
+
+    /** @param allowUnencrypted read on every legacy list and call; false refuses them with {@link #LOCAL_DENIED} */
+    RelayRequests(List<McpTool> registeredTools, AdtRestClient sapSession, ToolCatalog catalog,
+            Supplier<LocalPolicy> localPolicy, BooleanSupplier allowUnencrypted) {
+        this.executor = new ToolExecutor(registeredTools, sapSession, catalog);
+        this.localPolicy = localPolicy;
+        this.allowUnencrypted = allowUnencrypted;
     }
 
     String reply(String message) {
@@ -60,146 +89,90 @@ final class RelayRequests {
 
         JsonObject response = switch (method) {
             case "relay/hello" -> {
+                // A relay that does not advertise policy version 2 is an old relay: it sends no tool list.
+                JsonObject offered = params == null ? new JsonObject() : params.getAsJsonObject();
+                JsonElement version = offered.get("policyVersion");
+                if (version != null && version.isJsonPrimitive() && version.getAsJsonPrimitive().isNumber()
+                        && version.getAsString().equals(Integer.toString(POLICY_VERSION))) {
+                    relaySendsToolList = true;
+                }
                 JsonObject hello = new JsonObject();
-                hello.addProperty("policyVersion", 1);
+                hello.addProperty("policyVersion", POLICY_VERSION);
+                hello.addProperty("e2e", E2E_VERSION);
                 yield success(id, hello);
             }
             case "ping" -> success(id, new JsonObject());
-            case "tools/list" -> success(id, list());
-            case "tools/call" -> call(id, params == null ? new JsonObject() : params.getAsJsonObject());
+            case "tools/list" -> list(id, method, params == null ? new JsonObject() : params.getAsJsonObject());
+            case "tools/call" -> call(id, method, params == null ? new JsonObject() : params.getAsJsonObject());
             default -> error(id, -32601, "Unknown bridge method.");
         };
-        String text = response.toString();
-        if (text.length() > MAX_RESPONSE_BYTES || text.getBytes(StandardCharsets.UTF_8).length > MAX_RESPONSE_BYTES) {
-            return error(id, -32000, "The tool response exceeded the bridge limit. Check SAP before retrying an operation.").toString();
-        }
-        return text;
+        return ToolExecutor.limited(id, response);
     }
 
-    private JsonObject list() {
-        JsonArray definitions = new JsonArray();
-        for (McpTool tool : tools.values()) {
-            JsonObject definition = new JsonObject();
-            definition.addProperty("name", tool.getName());
-            definition.addProperty("description", tool.getDescription());
-            definition.add("inputSchema", tool.getInputSchema());
-            definitions.add(definition);
+    /**
+     * The tool names the relay allows for this call, or null from an old relay that never sent policy version 2.
+     *
+     * @throws IllegalArgumentException if the list is missing from a version 2 relay or is malformed
+     */
+    private Set<String> relayAllowed(JsonObject params) {
+        JsonElement value = params.get("relayAllowedTools");
+        if (value == null) {
+            if (relaySendsToolList) throw new IllegalArgumentException("Missing relay tool list.");
+            return null;
         }
-        JsonObject result = new JsonObject();
-        result.add("tools", definitions);
-        return result;
+        if (!value.isJsonArray() || value.getAsJsonArray().size() > MAX_RELAY_TOOLS) {
+            throw new IllegalArgumentException("Invalid relay tool list.");
+        }
+        Set<String> names = new HashSet<>();
+        for (JsonElement entry : value.getAsJsonArray()) {
+            String name = string(entry);
+            if (name == null || name.length() > 64) throw new IllegalArgumentException("Invalid relay tool list.");
+            names.add(name);
+        }
+        return names;
     }
 
-    private JsonObject call(JsonElement id, JsonObject params) {
-        RelayPackageScopes scopes;
+    /** The refusal for a legacy call when this Eclipse accepts only encrypted calls; otherwise null. */
+    private JsonObject refuseUnencrypted(JsonElement id, String method) {
+        if (allowUnencrypted.getAsBoolean()) return null;
+        LegacyCalls.refused(method);
+        return error(id, LOCAL_DENIED, UNENCRYPTED_REFUSED);
+    }
+
+    private JsonObject list(JsonElement id, String method, JsonObject params) {
+        JsonObject refused = refuseUnencrypted(id, method);
+        if (refused != null) return refused;
+        Set<String> relayAllowed;
         try {
-            scopes = RelayPackageScopes.parse(params.get("relayPackageScopes"));
+            relayAllowed = relayAllowed(params);
         } catch (IllegalArgumentException e) {
-            return error(id, -32602, "Missing or invalid relay package restrictions.");
+            return error(id, -32602, "Missing or invalid relay tool list.");
         }
-        McpTool tool = tools.get(string(params.get("name")));
-        if (tool == null) {
-            return error(id, -32602, "Unknown relay tool.");
-        }
-        JsonElement args = params.get("arguments");
-        if (args != null && !args.isJsonObject()) {
-            return error(id, -32602, "Expected a tool arguments object.");
-        }
-        JsonObject arguments = args == null ? new JsonObject() : args.getAsJsonObject();
-        if (!validArguments(tool.getInputSchema(), arguments)) {
-            return error(id, -32602, "The arguments do not match the SAP tool schema.");
-        }
-        if (SearchObjectTool.NAME.equals(tool.getName()) && string(arguments.get("query")).isBlank()) {
-            return error(id, -32602, "Enter a search query.");
-        }
-        try {
-            synchronized (sapSession) {
-                if (Thread.currentThread().isInterrupted()) {
-                    return error(id, -32000, "The call was canceled before dispatch.");
-                }
-                String result = scopes.unrestricted() ? tool.execute(arguments)
-                        : new ScopedSapCall(sapSession, scopes).execute(tool, arguments);
-                return success(id, toolResult(result, false));
-            }
-        } catch (ScopedSapCall.Denied e) {
-            return error(id, -32001, "SAP package access could not be verified for this call.");
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return success(id, toolResult("The call was interrupted. Check SAP for changes before retrying.", true));
-        } catch (Exception e) {
-            // SAP exceptions can include the request URI and the entire SAP response body.
-            return success(id, toolResult("The SAP tool failed. Its outcome is unknown. Check SAP before retrying.", true));
-        }
+        return executor.list(id, relayAllowed, localPolicy.get());
     }
 
-    private static boolean validArguments(JsonObject schema, JsonObject args) {
-        if (schema.has("required")) {
-            for (JsonElement required : schema.getAsJsonArray("required")) {
-                if (!args.has(required.getAsString())) return false;
-            }
-        }
-        JsonObject properties = schema.getAsJsonObject("properties");
-        for (String name : args.keySet()) {
-            if (!properties.has(name)) return false;
-            JsonObject spec = properties.getAsJsonObject(name);
-            JsonElement value = args.get(name);
-            if (spec.has("enum") && !spec.getAsJsonArray("enum").contains(value)) return false;
-            switch (spec.get("type").getAsString()) {
-                case "string" -> { if (string(value) == null) return false; }
-                case "integer" -> { if (!validInteger(value, spec)) return false; }
-                default -> { return false; }
-            }
-        }
-        return true;
-    }
-
-    private static boolean validInteger(JsonElement value, JsonObject spec) {
-        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) return false;
+    private JsonObject call(JsonElement id, String method, JsonObject params) {
+        JsonObject refused = refuseUnencrypted(id, method);
+        if (refused != null) return refused;
+        Set<String> relayAllowed;
         try {
-            int count = value.getAsBigDecimal().intValueExact();
-            return (!spec.has("minimum") || count >= spec.get("minimum").getAsInt())
-                    && (!spec.has("maximum") || count <= spec.get("maximum").getAsInt());
-        } catch (NumberFormatException | ArithmeticException e) {
-            return false;
+            relayAllowed = relayAllowed(params);
+        } catch (IllegalArgumentException e) {
+            return error(id, -32602, "Missing or invalid relay tool list.");
         }
+        // The legacy path applies the global local policy only.
+        return executor.call(id, params, relayAllowed, params.get("relayPackageScopes"), localPolicy.get());
     }
 
     private static String string(JsonElement value) {
-        return value != null && value.isJsonPrimitive() && value.getAsJsonPrimitive().isString()
-                ? value.getAsString() : null;
-    }
-
-    private static JsonObject toolResult(String text, boolean isError) {
-        JsonObject item = new JsonObject();
-        item.addProperty("type", "text");
-        item.addProperty("text", text);
-        JsonArray content = new JsonArray();
-        content.add(item);
-        JsonObject result = new JsonObject();
-        result.add("content", content);
-        result.addProperty("isError", isError);
-        return result;
-    }
-
-    private static JsonObject envelope(JsonElement id) {
-        JsonObject response = new JsonObject();
-        response.addProperty("jsonrpc", "2.0");
-        response.add("id", id);
-        return response;
+        return ToolExecutor.string(value);
     }
 
     private static JsonObject error(JsonElement id, int code, String message) {
-        JsonObject detail = new JsonObject();
-        detail.addProperty("code", code);
-        detail.addProperty("message", message);
-        JsonObject response = envelope(id);
-        response.add("error", detail);
-        return response;
+        return ToolExecutor.error(id, code, message);
     }
 
     private static JsonObject success(JsonElement id, JsonObject result) {
-        JsonObject response = envelope(id);
-        response.add("result", result);
-        return response;
+        return ToolExecutor.success(id, result);
     }
 }

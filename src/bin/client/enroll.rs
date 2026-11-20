@@ -1,139 +1,76 @@
-use std::{
-    fs,
-    io::{self, BufRead, IsTerminal, Read},
-    path::Path,
-    time::Duration,
-};
+use std::{fs, path::Path, sync::atomic::Ordering, time::Duration};
 
-use anyhow::{Context, Result, anyhow, ensure};
-use ring::{
-    digest,
-    rand::{SecureRandom, SystemRandom},
-};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use trillium_client::{Status, Url};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use ring::digest;
+use serde::Serialize;
+use trillium_client::Status;
 use zeroize::Zeroizing;
 
 use super::transport::{
-    Credentials, MAX_CREDENTIAL_BYTES, PROFILE_NAME, Profile, certificate, endpoint, https_client,
+    Credentials, MAX_CREDENTIAL_BYTES, PROFILE_NAME, Profile, certificate, endpoint,
 };
-use crate::{bootstrap, https::Response, storage, token};
-
-#[derive(Deserialize)]
-struct Approval {
-    id: String,
-    ca_pem: String,
-}
+use crate::{
+    bootstrap,
+    link::{EnrollLink, Role},
+    storage, token,
+};
 
 #[derive(Serialize)]
 struct Claim<'a> {
     token: &'a str,
 }
 
-fn operator_token() -> Result<Zeroizing<String>> {
-    eprintln!("Enter the enrollment token supplied by the server operator.");
-    let token = if io::stdin().is_terminal() {
-        Zeroizing::new(rpassword::read_password()?)
-    } else {
-        let mut bytes = Zeroizing::new(Vec::new());
-        io::stdin().lock().take(257).read_until(b'\n', &mut bytes)?;
-        ensure!(bytes.len() <= 256, "The token exceeds the size limit.");
-        Zeroizing::new(
-            std::str::from_utf8(&bytes)
-                .map_err(|_| anyhow!("Invalid token encoding."))?
-                .trim()
-                .to_owned(),
-        )
-    };
-    ensure!(
-        token.len() <= 256 && !token.is_empty(),
-        "Enter a valid enrollment token."
-    );
-    Ok(token)
-}
-
-/// Local wording for the relay's refusal codes (see `REFUSED_*` in `src/enrollment.rs`).
-fn refusal(status: Status, body: &[u8]) -> String {
-    match (status, body) {
-        (Status::Forbidden, b"registration-closed") => {
-            "Registration is closed on the relay. Ask the operator to open registration, then enroll again.".into()
-        }
-        (Status::Forbidden, b"request-denied") => {
-            "The operator denied this request, or closed registration while it waited. Enroll again.".into()
-        }
+/// The relay answers one generic 403 for a wrong, used, expired or cancelled link.
+fn refusal(status: Status) -> String {
+    match status {
+        Status::Forbidden => "The relay refused this link. It is wrong, already used, expired or cancelled. Ask the operator for a new link.".into(),
         _ => format!("Enrollment returned HTTP {status}."),
     }
 }
 
-async fn reply<T: DeserializeOwned>(response: Response) -> Result<T> {
+/// The CA fingerprint the link pins, once the link is known to be for a desktop.
+fn pinned_ca(link: &EnrollLink) -> Result<[u8; 32]> {
+    ensure!(
+        link.role == Role::Desktop,
+        "This link enrolls an Eclipse workspace, not a desktop. Paste it into the Eclipse Register dialog."
+    );
+    let decoded = token::decode(&link.token).context("The link's token is damaged.")?;
+    <[u8; 32]>::try_from(&decoded[32..]).map_err(|_| anyhow!("The link's token is damaged."))
+}
+
+async fn claim(link: &EnrollLink) -> Result<Profile> {
+    let pin = pinned_ca(link)?;
+    let url = endpoint(&format!("https://{}", link.enrollment), "/claim")?;
+    // The handshake fails unless the relay presents the CA the link names, so the secret
+    // below is sent only to the right relay.
+    let (http, mismatch) = bootstrap::pinned_client(pin)?;
+    let sent = http
+        .post(url)
+        .timeout(Duration::from_secs(30))
+        .json(&Claim { token: &link.token })
+        .send()
+        .await;
+    let response = match sent {
+        Ok(response) => response,
+        Err(_) if mismatch.load(Ordering::Acquire) => {
+            bail!(
+                "The relay's CA does not match the link: wrong relay or attacker in the middle. Nothing was sent."
+            );
+        }
+        Err(error) => return Err(error).context("Could not claim the enrollment."),
+    };
     let status = response.status();
-    if !status.is_success() {
-        let body = response.bytes(256).await.unwrap_or_default();
-        anyhow::bail!(refusal(status, &body));
-    }
+    ensure!(status.is_success(), "{}", refusal(status));
     let data = response.bytes(MAX_CREDENTIAL_BYTES).await?;
-    serde_json::from_slice(&data).map_err(|_| anyhow!("Invalid enrollment response."))
-}
-
-/// The profile's server must be the relay's mutual-TLS listener, not its registration listener.
-fn ensure_distinct_listeners(server: &Url, enrollment: &Url) -> Result<()> {
+    let credentials: Credentials =
+        serde_json::from_slice(&data).map_err(|_| anyhow!("Invalid enrollment response."))?;
+    let ca = certificate(credentials.ca.as_bytes())?;
     ensure!(
-        server.origin() != enrollment.origin(),
-        "--server and --enrollment name the same address. --server is the relay's mutual-TLS port (default 8787, the same as the Eclipse bridge URL); --enrollment is its registration port (default 8788)."
-    );
-    Ok(())
-}
-
-async fn request_profile(server: &str, enrollment: &str, label: &str) -> Result<Profile> {
-    let request = endpoint(enrollment, "/request")?;
-    ensure_distinct_listeners(&endpoint(server, "/mcp")?, &request)?;
-    let claim = endpoint(enrollment, "/claim")?;
-    let mut random = [0_u8; 16];
-    SystemRandom::new()
-        .fill(&mut random)
-        .map_err(|_| anyhow!("Could not generate a request ID."))?;
-    let id = hex::encode(random);
-    eprintln!("Enrollment request ID: {id}");
-    eprintln!("Role: desktop. Device label: {label}");
-    eprintln!("Compare the full ID, role, and label with the server operator before approval.");
-    let approval: Approval = reply(
-        bootstrap::request(request, &id, label)
-            .await
-            .context("Could not request enrollment.")?,
-    )
-    .await?;
-    ensure!(
-        approval.id == id,
-        "The operator approved a different request ID."
-    );
-    let ca = certificate(approval.ca_pem.as_bytes())?;
-    let pin = digest::digest(&digest::SHA256, ca.as_ref());
-    let grant = smol::unblock(operator_token).await?;
-    let decoded =
-        token::decode(&grant).context("The operator supplied an invalid enrollment token.")?;
-    ensure!(
-        &decoded[32..] == pin.as_ref(),
-        "The enrollment token belongs to a different CA."
-    );
-    // A new TLS connection must prove possession of a certificate issued by this authenticated CA.
-    let http = https_client(ca.clone(), None)?;
-    let credentials: Credentials = reply(
-        http.post(claim)
-            .timeout(Duration::from_secs(30))
-            .json(&Claim {
-                token: grant.trim(),
-            })
-            .send()
-            .await
-            .context("Could not claim the enrollment.")?,
-    )
-    .await?;
-    ensure!(
-        certificate(credentials.ca.as_bytes())? == ca,
-        "The claimed CA differs from the bootstrap CA."
+        digest::digest(&digest::SHA256, ca.as_ref()).as_ref() == pin.as_slice(),
+        "The issued CA differs from the CA in the link."
     );
     let profile = Profile {
-        server: server.to_owned(),
+        server: format!("https://{}", link.server),
         credentials,
     };
     // Validate the issued private key, certificate, and certification path before saving.
@@ -141,19 +78,13 @@ async fn request_profile(server: &str, enrollment: &str, label: &str) -> Result<
     Ok(profile)
 }
 
-pub async fn run(server: &str, enrollment: &str, label: &str, directory: &Path) -> Result<()> {
-    ensure!(
-        (1..=64).contains(&label.len())
-            && !label.trim().is_empty()
-            && label
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() || byte == b' '),
-        "Enter a printable ASCII client label of up to 64 characters."
-    );
+pub async fn run(link: &str, directory: &Path) -> Result<()> {
+    let link = EnrollLink::parse(link)?;
     storage::new_directory(directory)
         .context("Choose a new client profile directory in a trusted parent.")?;
     let result = async {
-        let profile = request_profile(server, enrollment, label).await?;
+        eprintln!("Enrolling this desktop with the relay {:?}.", link.name);
+        let profile = claim(&link).await?;
         let bytes = Zeroizing::new(serde_json::to_vec(&profile)?);
         ensure!(
             bytes.len() <= MAX_CREDENTIAL_BYTES,
@@ -175,25 +106,37 @@ pub async fn run(server: &str, enrollment: &str, label: &str, directory: &Path) 
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint, ensure_distinct_listeners, refusal};
-    use trillium_client::Status;
+    use super::*;
 
-    #[test]
-    fn the_server_and_enrollment_urls_must_name_different_listeners() {
-        let enrollment = endpoint("https://relay.example.org:8788", "/request").unwrap();
-        let same = endpoint("https://relay.example.org:8788", "/mcp").unwrap();
-        let data = endpoint("https://relay.example.org:8787", "/mcp").unwrap();
-        assert!(ensure_distinct_listeners(&same, &enrollment).is_err());
-        assert!(ensure_distinct_listeners(&data, &enrollment).is_ok());
+    /// A real token: secret bytes 0..32, CA fingerprint bytes 32..64.
+    const TOKEN: &str = "GW1-000G4-0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FJ089-24CJ2-A9H75-0MJMA-SC5MQ-2YC1H-68SK8-D9P6W-W3JEH-V7GYK-WFR";
+
+    fn link(role: &str) -> EnrollLink {
+        EnrollLink::parse(&format!(
+            "sap-adt://enroll?v=1&r={role}&n=Test&s=127.0.0.1:1&e=127.0.0.1:2&t={TOKEN}"
+        ))
+        .unwrap()
     }
 
     #[test]
-    fn refusal_codes_get_actionable_messages() {
-        assert!(refusal(Status::Forbidden, b"registration-closed").contains("open registration"));
-        assert!(refusal(Status::Forbidden, b"request-denied").contains("denied"));
+    fn the_link_pins_the_ca_fingerprint_from_its_token() {
+        let pin = pinned_ca(&link("desktop")).unwrap();
+        let expected: Vec<u8> = (32..64).collect();
+        assert_eq!(pin.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn an_eclipse_link_is_not_for_the_desktop_client() {
+        let error = pinned_ca(&link("eclipse")).unwrap_err();
+        assert!(error.to_string().contains("Eclipse"));
+    }
+
+    #[test]
+    fn a_refused_claim_gets_the_generic_wording() {
+        assert!(refusal(Status::Forbidden).contains("already used, expired or cancelled"));
         assert_eq!(
-            refusal(Status::Forbidden, b"other"),
-            "Enrollment returned HTTP 403 Forbidden."
+            refusal(Status::InternalServerError),
+            "Enrollment returned HTTP 500 Internal Server Error."
         );
     }
 }

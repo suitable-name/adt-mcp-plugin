@@ -1,9 +1,4 @@
-use std::{
-    fs::File,
-    io::{BufReader, Cursor, Read},
-    path::Path,
-    sync::Arc,
-};
+use std::{io::Cursor, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use rustls::{
@@ -14,11 +9,15 @@ use rustls::{
 };
 use serde::{Deserialize, Serialize};
 use trillium_client::Url;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
+
+pub use sap_adt_mcp_server_relay::{
+    keys::certificate,
+    storage::{MAX_CREDENTIAL_BYTES, read_file},
+};
 
 use crate::https::Client;
 
-pub const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub const PROFILE_NAME: &str = "credentials.json";
 
 #[derive(Deserialize, Serialize)]
@@ -55,18 +54,12 @@ impl Profile {
         let ca = certificate(self.credentials.ca.as_bytes())?;
         Ok((https_client(ca, Some(&self.credentials))?, url))
     }
-}
 
-pub fn read_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
-    let mut bytes = Zeroizing::new(Vec::new());
-    File::open(path)?
-        .take(MAX_CREDENTIAL_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= MAX_CREDENTIAL_BYTES,
-        "Credential file exceeds the size limit."
-    );
-    Ok(bytes)
+    /// The mutual-TLS client configuration for the relay's data port (the tunnel socket).
+    pub fn tls_config(&self) -> Result<ClientConfig> {
+        let ca = certificate(self.credentials.ca.as_bytes())?;
+        client_config(ca, Some(&self.credentials))
+    }
 }
 
 pub fn endpoint(origin: &str, path: &str) -> Result<Url> {
@@ -85,21 +78,14 @@ pub fn endpoint(origin: &str, path: &str) -> Result<Url> {
     Ok(url)
 }
 
-pub fn certificate(pem: &[u8]) -> Result<CertificateDer<'static>> {
-    let mut input = BufReader::new(pem);
-    let mut certs = rustls_pemfile::certs(&mut input);
-    let cert = certs
-        .next()
-        .transpose()?
-        .context("Expected a PEM certificate.")?;
-    ensure!(
-        certs.next().is_none(),
-        "Expected exactly one PEM certificate."
-    );
-    Ok(cert)
+pub fn https_client(ca: CertificateDer<'static>, identity: Option<&Credentials>) -> Result<Client> {
+    Ok(http_client(client_config(ca, identity)?))
 }
 
-pub fn https_client(ca: CertificateDer<'static>, identity: Option<&Credentials>) -> Result<Client> {
+fn client_config(
+    ca: CertificateDer<'static>,
+    identity: Option<&Credentials>,
+) -> Result<ClientConfig> {
     let provider = Arc::new(ring::default_provider());
     let mut roots = RootCertStore::empty();
     roots.add(ca)?;
@@ -123,7 +109,7 @@ pub fn https_client(ca: CertificateDer<'static>, identity: Option<&Credentials>)
         }
         None => builder.with_no_client_auth(),
     };
-    Ok(http_client(config))
+    Ok(config)
 }
 
 pub fn http_client(config: ClientConfig) -> Client {

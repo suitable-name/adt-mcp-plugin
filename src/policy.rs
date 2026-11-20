@@ -5,6 +5,7 @@ use std::{
     io::{Read, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -37,32 +38,61 @@ pub const TOOLS: &[&str] = &[
     "sap_usage_references",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolClass {
+    Read,
+    Execute,
+    Write,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ToolEntry {
+    name: String,
+    class: ToolClass,
+    package_aware: bool,
+    components: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolTable {
+    version: u32,
+    tools: Vec<ToolEntry>,
+}
+
+// The plugin bundles the same file and verifies its tools against it.
+static TOOL_TABLE: LazyLock<ToolTable> = LazyLock::new(|| {
+    let table: ToolTable = serde_json::from_str(include_str!(
+        "../java-plugin/sap-adt-mcp-server/com.sap.adt.mcp.server.plugin/resources/tools.json"
+    ))
+    .expect("tools.json is valid");
+    assert!(table.version == 1, "tools.json has an unsupported version");
+    table
+});
+
+fn tool_entry(tool: &str) -> Option<&'static ToolEntry> {
+    TOOL_TABLE.tools.iter().find(|entry| entry.name == tool)
+}
+
+#[must_use]
+pub fn tool_class(name: &str) -> Option<ToolClass> {
+    tool_entry(name).map(|entry| entry.class)
+}
+
 // A reference search posts to a fixed where-used endpoint. The other
-// observational tools use GET. SQL, test and check runs require opt-in.
+// read tools use GET. SQL, test and check runs require opt-in.
 fn observational(tool: &str) -> bool {
-    matches!(
-        tool,
-        "sap_abap_docu"
-            | "sap_get_source"
-            | "sap_inactive_objects"
-            | "sap_object_structure"
-            | "sap_search_object"
-            | "sap_usage_references"
-    )
+    tool_class(tool) == Some(ToolClass::Read)
 }
 
 fn package_aware(tool: &str) -> bool {
-    matches!(
-        tool,
-        "sap_activate"
-            | "sap_create_object"
-            | "sap_get_source"
-            | "sap_lock"
-            | "sap_object_structure"
-            | "sap_search_object"
-            | "sap_set_source"
-            | "sap_unlock"
-    )
+    tool_entry(tool).is_some_and(|entry| entry.package_aware)
+}
+
+fn components(tool: &str) -> &'static [String] {
+    tool_entry(tool).map_or(&[], |entry| entry.components.as_slice())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +241,13 @@ pub struct Document {
     // Earlier documents had no assignments. Migration starts with access to zero endpoints.
     #[serde(default, deserialize_with = "desktops")]
     pub(crate) endpoint_grants: BTreeMap<String, Vec<String>>,
+    /// Refuse legacy `/mcp` sessions on every endpoint (off in this version). Files without
+    /// the field load as off.
+    #[serde(default)]
+    pub(crate) require_e2e: bool,
+    /// Per-endpoint overrides of `require_e2e`, keyed by Eclipse endpoint fingerprint.
+    #[serde(default, deserialize_with = "desktops")]
+    pub(crate) require_e2e_endpoints: BTreeMap<String, bool>,
 }
 
 impl Default for Document {
@@ -224,25 +261,52 @@ impl Default for Document {
             },
             desktops: BTreeMap::new(),
             endpoint_grants: BTreeMap::new(),
+            require_e2e: false,
+            require_e2e_endpoints: BTreeMap::new(),
         }
     }
 }
 
+/// The end-to-end requirement as the operator interface shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct E2eSettings {
+    pub global: bool,
+    pub endpoints: BTreeMap<String, bool>,
+}
+
+impl E2eSettings {
+    /// Whether legacy sessions are refused for this endpoint: its override, else the global flag.
+    #[must_use]
+    pub fn required(&self, endpoint: &str) -> bool {
+        self.endpoints.get(endpoint).copied().unwrap_or(self.global)
+    }
+}
+
 impl Document {
+    pub(crate) fn e2e(&self) -> E2eSettings {
+        E2eSettings {
+            global: self.require_e2e,
+            endpoints: self.require_e2e_endpoints.clone(),
+        }
+    }
+
     fn effective(mut self, desktop: &str) -> Effective {
         let rules = self
             .desktops
             .remove(desktop)
             .unwrap_or_else(Rules::desktop_default);
         let permits = |tool: &str| self.global.permits(tool) && rules.permits(tool);
-        // Source writes can lock, activate and unlock regardless of the caller's options.
-        let source_dependencies = ["sap_lock", "sap_unlock", "sap_activate"]
-            .into_iter()
-            .all(permits);
+        // A tool such as a source write can lock, activate and unlock regardless
+        // of the caller's options, so its component tools must be permitted too.
         let actions = TOOLS
             .iter()
             .copied()
-            .filter(|tool| permits(tool) && (*tool != "sap_set_source" || source_dependencies))
+            .filter(|tool| {
+                permits(tool)
+                    && components(tool)
+                        .iter()
+                        .all(|component| permits(component.as_str()))
+            })
             .collect();
         let package_scopes = [self.global.packages, rules.packages]
             .into_iter()
@@ -251,6 +315,7 @@ impl Document {
         Effective {
             actions,
             package_scopes,
+            e2e_required: false,
         }
     }
 }
@@ -258,15 +323,27 @@ impl Document {
 pub struct Effective {
     actions: Vec<&'static str>,
     package_scopes: Vec<Vec<String>>,
+    e2e_required: bool,
 }
 
 impl Effective {
+    /// Legacy `/mcp` sessions are refused for this endpoint.
+    pub(crate) const fn e2e_required(&self) -> bool {
+        self.e2e_required
+    }
+
     pub(crate) fn allows(&self, tool: &str) -> bool {
         self.actions.contains(&tool)
     }
 
     pub(crate) const fn package_scopes(&self) -> &[Vec<String>] {
         self.package_scopes.as_slice()
+    }
+
+    /// The tools this policy allows, in catalog order (what the plugin receives as
+    /// `relayAllowedTools`, and what a stream's policy fingerprint is made of).
+    pub(crate) const fn allowed_tools(&self) -> &[&'static str] {
+        self.actions.as_slice()
     }
 }
 
@@ -372,9 +449,55 @@ impl PolicyStore {
             .endpoint_grants
             .get(&pin)
             .is_some_and(|ids| ids.binary_search_by(|id| id.as_str().cmp(endpoint)).is_ok());
-        Ok(granted.then(|| document.effective(&pin)))
+        let required = document.e2e().required(endpoint);
+        Ok(granted.then(|| {
+            let mut effective = document.effective(&pin);
+            effective.e2e_required = required;
+            effective
+        }))
     }
 
+    /// Replace the global rules and the global end-to-end requirement in one write.
+    pub(crate) fn set_global_with_e2e(
+        &self,
+        revision: &str,
+        mut rules: Rules,
+        require_e2e: bool,
+    ) -> Result<()> {
+        rules.normalize()?;
+        self.update(revision, |document| {
+            document.global = rules;
+            document.require_e2e = require_e2e;
+            Ok(())
+        })
+    }
+
+    /// Flip the end-to-end requirement of one endpoint and return the new state. An override
+    /// equal to the global flag is not stored.
+    pub(crate) fn toggle_endpoint_e2e(&self, endpoint: &str) -> Result<bool> {
+        ensure!(valid_fingerprint(endpoint), "Invalid endpoint fingerprint.");
+        let revision = self.snapshot()?.revision;
+        let mut required = false;
+        self.update(&revision, |document| {
+            required = !document.e2e().required(endpoint);
+            if required == document.require_e2e {
+                document.require_e2e_endpoints.remove(endpoint);
+            } else {
+                ensure!(
+                    document.require_e2e_endpoints.contains_key(endpoint)
+                        || document.require_e2e_endpoints.len() < MAX_DESKTOPS,
+                    "Too many endpoint overrides."
+                );
+                document
+                    .require_e2e_endpoints
+                    .insert(endpoint.to_owned(), required);
+            }
+            Ok(())
+        })?;
+        Ok(required)
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_global(&self, revision: &str, mut rules: Rules) -> Result<()> {
         rules.normalize()?;
         self.update(revision, |document| {
@@ -478,6 +601,72 @@ mod tests {
             actions: None,
             packages: None,
         }
+    }
+
+    #[test]
+    fn tool_table_matches_the_known_tool_names_and_rules() {
+        assert_eq!(TOOL_TABLE.version, 1);
+        let names: Vec<&str> = TOOL_TABLE
+            .tools
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, TOOLS);
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+        for entry in &TOOL_TABLE.tools {
+            assert!(
+                entry
+                    .components
+                    .iter()
+                    .all(|component| TOOLS.contains(&component.as_str())),
+                "{} lists an unknown component",
+                entry.name
+            );
+        }
+        let read = [
+            "sap_abap_docu",
+            "sap_get_source",
+            "sap_inactive_objects",
+            "sap_object_structure",
+            "sap_search_object",
+            "sap_usage_references",
+        ];
+        let write = [
+            "sap_activate",
+            "sap_create_object",
+            "sap_lock",
+            "sap_set_source",
+            "sap_unlock",
+        ];
+        let package = [
+            "sap_activate",
+            "sap_create_object",
+            "sap_get_source",
+            "sap_lock",
+            "sap_object_structure",
+            "sap_search_object",
+            "sap_set_source",
+            "sap_unlock",
+        ];
+        for tool in TOOLS {
+            let class = tool_class(tool).unwrap();
+            assert_eq!(observational(tool), read.contains(tool));
+            assert_eq!(class == ToolClass::Read, read.contains(tool));
+            assert_eq!(class == ToolClass::Write, write.contains(tool));
+            assert_eq!(package_aware(tool), package.contains(tool));
+            let expected: &[&str] = if *tool == "sap_set_source" {
+                &["sap_lock", "sap_unlock", "sap_activate"]
+            } else {
+                &[]
+            };
+            assert_eq!(components(tool), expected);
+        }
+        assert_eq!(tool_class("unknown"), None);
+        assert!(!observational("unknown") && !package_aware("unknown"));
+        assert_eq!(components("unknown"), &[] as &[String]);
     }
 
     #[test]
@@ -739,6 +928,64 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn require_e2e_defaults_off_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PolicyStore::load(dir.path()).unwrap();
+        let (desktop, endpoint, other) = ([1; 32], hex::encode([2; 32]), hex::encode([3; 32]));
+        let document = store.snapshot().unwrap();
+        assert_eq!(document.e2e(), E2eSettings::default());
+        // A file written before the setting existed loads as off.
+        let old = serde_json::json!({
+            "global": unrestricted(),
+            "desktops": BTreeMap::<String, Rules>::new(),
+            "endpoint_grants": {hex::encode(desktop): [endpoint]},
+        });
+        fs::write(store.path(), serde_json::to_vec(&old).unwrap()).unwrap();
+        let effective = store
+            .effective_for_endpoint(&desktop, &endpoint)
+            .unwrap()
+            .unwrap();
+        assert!(!effective.e2e_required());
+
+        // The global flag applies to every endpoint; an override wins either way.
+        let revision = store.snapshot().unwrap().revision;
+        store
+            .set_global_with_e2e(&revision, unrestricted(), true)
+            .unwrap();
+        let settings = store.snapshot().unwrap().e2e();
+        assert!(settings.required(&endpoint) && settings.required(&other));
+        assert!(!store.toggle_endpoint_e2e(&endpoint).unwrap());
+        let reloaded = PolicyStore::load(dir.path()).unwrap();
+        let settings = reloaded.snapshot().unwrap().e2e();
+        assert!(settings.global && !settings.required(&endpoint) && settings.required(&other));
+        let relaxed = reloaded
+            .effective_for_endpoint(&desktop, &endpoint)
+            .unwrap()
+            .unwrap();
+        assert!(!relaxed.e2e_required());
+        // Toggling back matches the global flag, so no override is stored.
+        assert!(reloaded.toggle_endpoint_e2e(&endpoint).unwrap());
+        assert!(
+            reloaded
+                .snapshot()
+                .unwrap()
+                .require_e2e_endpoints
+                .is_empty()
+        );
+        let revision = reloaded.snapshot().unwrap().revision;
+        reloaded
+            .set_global_with_e2e(&revision, unrestricted(), false)
+            .unwrap();
+        assert!(reloaded.toggle_endpoint_e2e(&endpoint).unwrap());
+        let required = reloaded
+            .effective_for_endpoint(&desktop, &endpoint)
+            .unwrap()
+            .unwrap();
+        assert!(required.e2e_required());
+        assert!(reloaded.toggle_endpoint_e2e("not a fingerprint").is_err());
     }
 
     #[test]

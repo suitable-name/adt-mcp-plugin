@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Stdout},
+    io::{self, Stdin, Stdout},
     path::Path,
     sync::{
         Arc,
@@ -19,27 +19,31 @@ use trillium_client::{HeaderValue, KnownHeaderName, Method, Status, Url};
 
 use crate::{
     endpoints,
+    host::Host,
     https::{Client, RequestBuilder},
+    peers::{Peers, Route},
     rt,
     transport::Profile,
 };
 
 const MAX_REQUEST: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE: usize = 9 * 1024 * 1024;
-const MAX_CONCURRENT: usize = 16;
+pub const MAX_CONCURRENT: usize = 16;
 const SESSION_ID: &str = "mcp-session-id";
 const VERSION: &str = "mcp-protocol-version";
-type Output = Arc<Mutex<Unblock<Stdout>>>;
-type Jobs = Vec<Task<Result<()>>>;
+pub type Output = Arc<Mutex<Unblock<Stdout>>>;
+pub type Reader = BufReader<Unblock<Stdin>>;
+pub type Jobs = Vec<Task<Result<()>>>;
 
-#[derive(Clone)]
-struct Remote {
-    http: Client,
-    url: Url,
-    endpoint: HeaderValue,
+/// How this process reaches the selected endpoint.
+enum Connection {
+    /// The endpoint is paired: end to end through the tunnel, never through `/mcp`.
+    Tunnel(Box<Host>),
+    /// The endpoint was never paired: the relay-readable `/mcp` path, with a warning.
+    Legacy(Box<Remote>),
 }
 
-impl Remote {
+impl Connection {
     fn open(directory: Option<&Path>) -> Result<Self> {
         let directory = directory.with_context(|| format!(
             "No desktop profile was configured. Set the MCP host arguments to connect --profile <dir>, using your enrolled profile directory. For enrollment instructions run sap-adt-mcp-client enroll --help. {}",
@@ -58,13 +62,40 @@ impl Remote {
                 endpoints::SELECT_HELP
             )
         })?;
-        Ok(Self {
+        // A damaged peers.json is an error, never "unpaired": that would be a downgrade.
+        let peers = Peers::load(directory).with_context(|| {
+            format!(
+                "Cannot read the pairings of profile {}. Repair or remove peers.json (removing it forgets every pairing).",
+                directory.display()
+            )
+        })?;
+        let route = peers.route(&selection);
+        if let Route::Tunnel(pin) = route {
+            return Ok(Self::Tunnel(Box::new(Host::new(
+                directory, profile, selection, pin,
+            )?)));
+        }
+        ensure!(route.legacy_allowed(), "Internal routing error.");
+        eprintln!(
+            "This endpoint is not paired; traffic is readable by the relay. Pair it with: sap-adt-mcp-client pair --profile {} --link \"<sap-adt://pair link from Eclipse>\"",
+            directory.display()
+        );
+        Ok(Self::Legacy(Box::new(Remote {
             http,
             url,
             endpoint: HeaderValue::from(selection),
-        })
+        })))
     }
+}
 
+#[derive(Clone)]
+struct Remote {
+    http: Client,
+    url: Url,
+    endpoint: HeaderValue,
+}
+
+impl Remote {
     fn request(&self, method: Method) -> RequestBuilder {
         self.http
             .request(method, &self.url)
@@ -98,7 +129,7 @@ impl Session {
     }
 }
 
-async fn write(output: &Output, message: &Value) -> Result<()> {
+pub async fn write(output: &Output, message: &Value) -> Result<()> {
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
     let mut stdout = output.lock().await;
@@ -108,8 +139,66 @@ async fn write(output: &Output, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
+pub fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// Standard output and input of the MCP host.
+pub fn host_io() -> (Output, Reader) {
+    (
+        Arc::new(Mutex::new(Unblock::new(io::stdout()))),
+        BufReader::new(Unblock::new(io::stdin())),
+    )
+}
+
+/// One line of the host's input.
+pub enum Input {
+    Eof,
+    /// The line was refused (and answered); read the next one.
+    Skip,
+    Message {
+        bytes: Vec<u8>,
+        message: Value,
+    },
+}
+
+/// Reads and validates one newline-delimited JSON-RPC message from the host.
+pub async fn read_input(input: &mut Reader, output: &Output) -> Result<Input> {
+    let mut bytes = Vec::new();
+    let length = (&mut *input)
+        .take(MAX_REQUEST as u64 + 2)
+        .read_until(b'\n', &mut bytes)
+        .await?;
+    if length == 0 {
+        return Ok(Input::Eof);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    ensure!(
+        bytes.len() <= MAX_REQUEST,
+        "Standard input exceeded the MCP request size limit."
+    );
+    let Ok(message) = serde_json::from_slice::<Value>(&bytes) else {
+        write(output, &rpc_error(&Value::Null, -32700, "Invalid JSON.")).await?;
+        return Ok(Input::Skip);
+    };
+    let id = message.get("id");
+    if message["jsonrpc"] != "2.0"
+        || !message["method"].is_string()
+        || id.is_some_and(|id| !(id.is_string() || id.is_i64() || id.is_u64()))
+    {
+        write(
+            output,
+            &rpc_error(&Value::Null, -32600, "Invalid JSON-RPC request."),
+        )
+        .await?;
+        return Ok(Input::Skip);
+    }
+    Ok(Input::Message { bytes, message })
 }
 
 struct Reply {
@@ -235,20 +324,24 @@ async fn exchange(
         Err(error) => {
             eprintln!("Relay request failed: {error:#}");
             if let Some(id) = id {
-                let text = if message["method"] == "tools/call" {
-                    "The relay response is unavailable. The tool may have completed. Check its outcome before retrying."
-                } else {
-                    "The relay response is unavailable. Check the relay connection."
-                };
-                write(output, &rpc_error(id, -32_000, text)).await?;
+                write(output, &rpc_error(id, -32_000, unavailable(message))).await?;
             }
             Ok(None)
         }
     }
 }
 
+/// The text a host reads when no response arrived; a tool call may have run anyway.
+pub fn unavailable(message: &Value) -> &'static str {
+    if message["method"] == "tools/call" {
+        "The relay response is unavailable. The tool may have completed. Check its outcome before retrying."
+    } else {
+        "The relay response is unavailable. Check the relay connection."
+    }
+}
+
 /// Await the jobs that have already finished so their errors surface promptly.
-async fn reap(jobs: &mut Jobs) -> Result<()> {
+pub async fn reap(jobs: &mut Jobs) -> Result<()> {
     let mut index = 0;
     while index < jobs.len() {
         if jobs[index].is_finished() {
@@ -265,44 +358,15 @@ async fn messages(
     session: &mut Option<Session>,
     jobs: &mut Jobs,
 ) -> Result<()> {
-    let output = Arc::new(Mutex::new(Unblock::new(io::stdout())));
-    let mut input = BufReader::new(Unblock::new(io::stdin()));
+    let (output, mut input) = host_io();
     loop {
         reap(jobs).await?;
-        let mut bytes = Vec::new();
-        let length = (&mut input)
-            .take(MAX_REQUEST as u64 + 2)
-            .read_until(b'\n', &mut bytes)
-            .await?;
-        if length == 0 {
-            return Ok(());
-        }
-        if bytes.last() == Some(&b'\n') {
-            bytes.pop();
-        }
-        if bytes.last() == Some(&b'\r') {
-            bytes.pop();
-        }
-        ensure!(
-            bytes.len() <= MAX_REQUEST,
-            "Standard input exceeded the MCP request size limit."
-        );
-        let Ok(message) = serde_json::from_slice::<Value>(&bytes) else {
-            write(&output, &rpc_error(&Value::Null, -32700, "Invalid JSON.")).await?;
-            continue;
+        let (bytes, message) = match read_input(&mut input, &output).await? {
+            Input::Eof => return Ok(()),
+            Input::Skip => continue,
+            Input::Message { bytes, message } => (bytes, message),
         };
         let id = message.get("id");
-        if message["jsonrpc"] != "2.0"
-            || !message["method"].is_string()
-            || id.is_some_and(|id| !(id.is_string() || id.is_i64() || id.is_u64()))
-        {
-            write(
-                &output,
-                &rpc_error(&Value::Null, -32600, "Invalid JSON-RPC request."),
-            )
-            .await?;
-            continue;
-        }
         let initialize = message["method"] == "initialize" && id.is_some();
         let remote = match connection {
             Ok(remote) => remote,
@@ -361,12 +425,19 @@ async fn messages(
     }
 }
 
-pub async fn run(directory: Option<&Path>) -> Result<()> {
-    let remote = Remote::open(directory).map_err(|err| err.to_string());
-    let connection = remote.as_ref().map_err(String::as_str);
-    if let Err(reason) = connection {
-        eprintln!("{reason}");
+/// A closed pipe to the host is the normal end of a session, not a failure.
+pub fn end_of_session(outcome: Result<()>) -> Result<()> {
+    if let Err(error) = &outcome
+        && error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|err| err.kind() == io::ErrorKind::BrokenPipe)
+    {
+        return Ok(());
     }
+    outcome
+}
+
+async fn run_legacy(connection: Result<&Remote, &str>) -> Result<()> {
     let mut jobs = Jobs::new();
     let mut session = None;
     let mut outcome = messages(connection, &mut session, &mut jobs).await;
@@ -379,12 +450,17 @@ pub async fn run(directory: Option<&Path>) -> Result<()> {
     if let (Some(session), Ok(target)) = (session, connection) {
         session.close(target).await;
     }
-    if let Err(error) = &outcome
-        && error
-            .downcast_ref::<io::Error>()
-            .is_some_and(|err| err.kind() == io::ErrorKind::BrokenPipe)
-    {
-        return Ok(());
+    end_of_session(outcome)
+}
+
+pub async fn run(directory: Option<&Path>) -> Result<()> {
+    let connection = Connection::open(directory).map_err(|err| err.to_string());
+    match &connection {
+        Ok(Connection::Tunnel(host)) => crate::host::run(host).await,
+        Ok(Connection::Legacy(remote)) => run_legacy(Ok(remote)).await,
+        Err(reason) => {
+            eprintln!("{reason}");
+            run_legacy(Err(reason.as_str())).await
+        }
     }
-    outcome
 }

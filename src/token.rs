@@ -2,7 +2,9 @@ use zeroize::Zeroizing;
 
 pub const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/// Decode the `diagram_loader` GW1 secret and its CA DER fingerprint.
+/// Decodes a `GW1-` token into its 64-byte payload: the 32-byte secret, then the 32-byte
+/// fingerprint the link pins. `None` for anything that is not a well-formed token.
+#[must_use]
 pub fn decode(token: &str) -> Option<Zeroizing<[u8; 64]>> {
     let token = token.trim();
     if !token.get(..3)?.eq_ignore_ascii_case("GW1") {
