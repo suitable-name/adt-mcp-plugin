@@ -73,7 +73,11 @@ async fn check_issue_guards(pki: &Path, enrollment: SocketAddr, ca: &[u8]) -> Re
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(pki.join("issue.secret"))?.permissions().mode();
-        ensure!(mode & 0o077 == 0, "issue.secret is not owner-only.");
+        // Owner-only: the group and other permission bits (the low six) are all clear.
+        ensure!(
+            mode.trailing_zeros() >= 6,
+            "issue.secret is not owner-only."
+        );
     }
     expect_status(&http, &issue_url, &[], &body, Status::Forbidden).await?;
     let wrong = format!("Bearer {}", "0".repeat(64));

@@ -20,7 +20,10 @@ use smol::{
     lock::{Semaphore, SemaphoreGuardArc},
     net::{TcpListener, TcpStream},
 };
-use trillium_http::{HttpConfig, HttpContext};
+use trillium_http::{
+    HttpConfig, HttpContext,
+    h1::{H1Connection, H1ConnectionResult},
+};
 
 use crate::rt::{self, timeout};
 
@@ -171,6 +174,9 @@ pub trait Service: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = ()> + Send;
 }
 
+/// How long a finished connection may take to close gracefully.
+const GRACEFUL_CLOSE: Duration = Duration::from_secs(5);
+
 /// Each listener has its own connection budget. Only an authenticated TLS
 /// handshake can populate a peer certificate.
 pub async fn listen<S: Service>(
@@ -229,8 +235,8 @@ async fn serve<S: Service>(
     let peer = Peer { addr, cert };
     let (transport, enforce) = Guarded::new(stream);
     let handoff = Handoff::default();
-    let result = context
-        .run(transport, |conn| {
+    let result = H1Connection::new(context, transport)
+        .run(|conn| {
             let service = service.clone();
             let peer = peer.clone();
             let handoff = handoff.clone();
@@ -238,15 +244,23 @@ async fn serve<S: Service>(
         })
         .await;
     match result {
-        Ok(Some(upgrade)) => {
+        H1ConnectionResult::Upgrade(upgrade) => {
             // An upgraded connection outlives the HTTP connection budget
             // and is bounded by its own limit (for example, the bridge limit).
             drop(permit);
             enforce.store(false, Ordering::Relaxed);
             service.upgrade(upgrade, &peer, handoff.take()).await;
         }
-        Ok(None) => drop(permit),
-        Err(_) => {
+        H1ConnectionResult::Close(close) => {
+            // Close gracefully: stop sending, then discard what the client still sends (such
+            // as the body of a refused request) until it closes. Dropping the socket instead
+            // makes the OS answer with a TCP reset, which can destroy the response before the
+            // client reads it (seen on Linux). The timeout bounds a client that never closes.
+            let _ = timeout(GRACEFUL_CLOSE, close).await;
+            drop(permit);
+        }
+        // An error, or a kind of ending this trillium-http version does not have yet.
+        _ => {
             drop(permit);
             tracing::debug!(%addr, "HTTP connection ended before completion.");
         }
